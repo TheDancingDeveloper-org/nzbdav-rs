@@ -1,0 +1,1340 @@
+use axum::extract::{Multipart, Path, Query, State};
+use axum::response::Json;
+use chrono::Utc;
+use serde::Deserialize;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use nzb_core::nzb_parser::parse_nzb;
+use nzbdav_core::blob_store::BlobStore;
+use nzbdav_core::models::{DownloadStatus, QueueItem};
+use nzbdav_core::{dav_items, history_items, queue_items};
+
+use crate::state::AppState;
+
+use super::models::{
+    AddFileResponse, CategoriesResponse, HistoryData, HistoryResponse, HistorySlot, QueueSlot,
+    SimpleResponse, VersionResponse,
+};
+
+#[derive(Deserialize)]
+pub struct ApiParams {
+    pub mode: String,
+    #[allow(dead_code)]
+    pub apikey: Option<String>,
+    #[allow(dead_code)]
+    pub output: Option<String>,
+    // Queue/history params
+    pub name: Option<String>,
+    pub value: Option<String>,
+    pub cat: Option<String>,
+    pub priority: Option<i32>,
+    pub password: Option<String>,
+    pub start: Option<i64>,
+    pub limit: Option<i64>,
+    /// Job label sent by AIOStreams/SABnzbd clients — used as the folder/job name.
+    pub nzbname: Option<String>,
+    /// Comma-separated nzo_ids to filter history results (AIOStreams polling).
+    pub nzo_ids: Option<String>,
+    /// Category filter for history (Usenet-Ultimate sends `category=`, others send `cat=`).
+    pub category: Option<String>,
+    /// Sonarr sends del_files=1 on delete; accepted and ignored.
+    #[allow(dead_code)]
+    pub del_files: Option<i32>,
+}
+
+/// Main SABnzbd-compatible API endpoint. Dispatches by `mode` query parameter.
+pub async fn sab_api(
+    State(state): State<AppState>,
+    Query(params): Query<ApiParams>,
+    multipart: Option<Multipart>,
+) -> Json<serde_json::Value> {
+    match params.mode.as_str() {
+        "addfile" => handle_addfile(state, params, multipart).await,
+        "addurl" => handle_addurl(state, params).await,
+        "queue" => handle_queue(state, params),
+        "history" => handle_history(state, params),
+        "retry" => handle_retry(state, params),
+        "version" => {
+            // Report SABnzbd-compatible version (>= 0.7.0) so Sonarr/Radarr accept us
+            Json(
+                serde_json::to_value(VersionResponse {
+                    version: "4.0.0".to_string(),
+                })
+                .unwrap(),
+            )
+        }
+        "status" | "fullstatus" => {
+            // SABnzbd-compatible fullstatus — Sonarr parses specific nested fields
+            Json(serde_json::json!({
+                "status": {
+                    "version": "4.0.0",
+                    "paused": false,
+                    "pause_int": "0",
+                    "kbpersec": "0.00",
+                    "speed": "0 ",
+                    "mbleft": "0.00",
+                    "mb": "0.00",
+                    "noofslots": 0,
+                    "noofslots_total": 0,
+                    "timeleft": "0:00:00",
+                    "eta": "unknown",
+                    "diskspace1": "999.99",
+                    "diskspacetotal1": "999.99",
+                    "diskspace2": "999.99",
+                    "diskspacetotal2": "999.99",
+                    "have_warnings": "0",
+                    "loadavg": "",
+                    "cache_art": "0",
+                    "cache_size": "0 B",
+                    "finishaction": null,
+                    "quota": "",
+                    "left_quota": "",
+                    "speedlimit": "",
+                    "servers": []
+                }
+            }))
+        }
+        "get_config" => {
+            // SABnzbd-compatible config structure — Sonarr parses misc and servers
+            let categories = state.config.get_categories();
+            let cats: Vec<serde_json::Value> = categories.iter()
+                .map(|c| serde_json::json!({"name": c, "order": 0, "dir": "", "newzbin": "", "priority": 0}))
+                .collect();
+            Json(serde_json::json!({
+                "config": {
+                    "misc": {
+                        "port": "8080",
+                        "host": "0.0.0.0",
+                        "api_key": "",
+                        "complete_dir": "/content",
+                        "dirscan_dir": "",
+                        "download_dir": "/content",
+                        "history_retention": "all",
+                        "pause_on_post_processing": 0,
+                        "pre_check": 0,
+                        "quota_size": "",
+                        "quota_day": "",
+                        "quota_period": "m",
+                        "refresh_rate": 1,
+                        "bandwidth_max": "",
+                        "cache_limit": "512M"
+                    },
+                    "categories": cats,
+                    "servers": []
+                }
+            }))
+        }
+        "get_cats" => {
+            let categories = state.config.get_categories();
+            Json(serde_json::to_value(CategoriesResponse { categories }).unwrap())
+        }
+        unknown => {
+            warn!(mode = %unknown, "unknown SAB API mode");
+            Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("unknown mode: {unknown}")),
+                })
+                .unwrap(),
+            )
+        }
+    }
+}
+
+/// Handle `mode=addfile` -- accept NZB upload via multipart form.
+async fn handle_addfile(
+    state: AppState,
+    params: ApiParams,
+    multipart: Option<Multipart>,
+) -> Json<serde_json::Value> {
+    let Some(mut multipart) = multipart else {
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some("multipart body required for addfile".to_string()),
+            })
+            .unwrap(),
+        );
+    };
+
+    // Extract the NZB file from multipart fields.
+    // Accept "nzbfile" (SABnzbd standard, UsenetStreamer) and "nzbFile" (Usenet-Ultimate)
+    // using case-insensitive matching. Also accept "name" for older clients.
+    let mut nzb_data: Option<Vec<u8>> = None;
+    let mut nzb_filename: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name.eq_ignore_ascii_case("nzbfile") || field_name == "name" {
+            nzb_filename = field.file_name().map(|s| s.to_string());
+            match field.bytes().await {
+                Ok(bytes) => nzb_data = Some(bytes.to_vec()),
+                Err(e) => {
+                    warn!(error = %e, "failed to read multipart field");
+                    return Json(
+                        serde_json::to_value(SimpleResponse {
+                            status: false,
+                            error: Some(format!("failed to read upload: {e}")),
+                        })
+                        .unwrap(),
+                    );
+                }
+            }
+            break;
+        }
+    }
+
+    let Some(data) = nzb_data else {
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some("no NZB file found in upload".to_string()),
+            })
+            .unwrap(),
+        );
+    };
+
+    // Prefer nzbname (job label from client) over the multipart filename, matching
+    // addurl behaviour. Usenet-Ultimate and UsenetStreamer both send nzbname so that
+    // the WebDAV folder name is predictable for deduplication.
+    let filename = match params.nzbname.filter(|s| !s.is_empty()) {
+        Some(name) => {
+            if name.ends_with(".nzb") {
+                name
+            } else {
+                format!("{name}.nzb")
+            }
+        }
+        None => nzb_filename.unwrap_or_else(|| "unknown.nzb".to_string()),
+    };
+    let category = params.cat.unwrap_or_default();
+    let priority = params.priority.unwrap_or(0);
+
+    enqueue_nzb(
+        state,
+        &filename,
+        &data,
+        &category,
+        priority,
+        params.password.as_deref(),
+    )
+}
+
+/// Handle `mode=addurl` -- fetch NZB from a URL and enqueue it.
+async fn handle_addurl(state: AppState, params: ApiParams) -> Json<serde_json::Value> {
+    let Some(url) = params.name.or(params.value) else {
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some("URL is required (pass as 'name' or 'value' parameter)".to_string()),
+            })
+            .unwrap(),
+        );
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, url = %url, "failed to fetch NZB from URL");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("failed to fetch URL: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    if !resp.status().is_success() {
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some(format!("HTTP {} fetching URL", resp.status())),
+            })
+            .unwrap(),
+        );
+    }
+
+    let data = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            warn!(error = %e, "failed to read NZB response body");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("failed to read response: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    // Prefer nzbname (job label from client) over the URL basename.
+    let filename = match params.nzbname.filter(|s| !s.is_empty()) {
+        Some(name) => {
+            if name.ends_with(".nzb") {
+                name
+            } else {
+                format!("{name}.nzb")
+            }
+        }
+        None => url
+            .rsplit('/')
+            .next()
+            .filter(|s| s.ends_with(".nzb"))
+            .unwrap_or("download.nzb")
+            .to_string(),
+    };
+
+    let category = params.cat.unwrap_or_default();
+    let priority = params.priority.unwrap_or(0);
+
+    enqueue_nzb(
+        state,
+        &filename,
+        &data,
+        &category,
+        priority,
+        params.password.as_deref(),
+    )
+}
+
+/// Shared logic: parse an NZB, store it, and insert a queue item.
+fn enqueue_nzb(
+    state: AppState,
+    filename: &str,
+    data: &[u8],
+    category: &str,
+    priority: i32,
+    password: Option<&str>,
+) -> Json<serde_json::Value> {
+    // Embed password in the filename using {{password}} convention so
+    // the pipeline's get_nzb_password() picks it up during processing.
+    let stored_filename = match password {
+        Some(pw) if !pw.is_empty() && nzbdav_core::util::get_nzb_password(filename).is_none() => {
+            let base = filename.trim_end_matches(".nzb");
+            format!("{base} {{{{{pw}}}}}.nzb")
+        }
+        _ => filename.to_string(),
+    };
+    let job_name = nzbdav_core::util::get_job_name(&stored_filename);
+    let nzb_job = match parse_nzb(&job_name, data) {
+        Ok(job) => job,
+        Err(e) => {
+            // Log the first 300 bytes so we can see what was actually received
+            // (HTML error page, JSON, gzip, empty, etc.).
+            let snippet = String::from_utf8_lossy(&data[..data.len().min(300)]);
+            warn!(
+                error = %e,
+                filename = %filename,
+                data_len = data.len(),
+                first_bytes = %snippet,
+                "failed to parse NZB"
+            );
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("invalid NZB: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    let total_segment_bytes: u64 = nzb_job.files.iter().map(|f| f.bytes).sum();
+    let item_id = Uuid::new_v4();
+
+    let item = QueueItem {
+        id: item_id,
+        created_at: Utc::now().naive_utc(),
+        file_name: stored_filename.clone(),
+        job_name,
+        nzb_file_size: data.len() as i64,
+        total_segment_bytes: total_segment_bytes as i64,
+        category: category.to_string(),
+        priority,
+        post_processing: -1,
+        pause_until: None,
+    };
+
+    {
+        let conn = state.db.lock();
+        if let Err(e) = BlobStore::put_nzb_blob(&conn, item_id, data) {
+            warn!(error = %e, "failed to store NZB blob");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("failed to store NZB: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+        if let Err(e) = queue_items::insert(&conn, &item) {
+            warn!(error = %e, "failed to insert queue item");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("failed to enqueue: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    }
+
+    info!(
+        nzo_id = %item.id,
+        filename = %stored_filename,
+        total_segment_bytes,
+        has_password = password.is_some(),
+        "NZB added to queue"
+    );
+
+    Json(
+        serde_json::to_value(AddFileResponse {
+            status: true,
+            nzo_ids: vec![item.id.to_string()],
+        })
+        .unwrap(),
+    )
+}
+
+/// Handle `mode=queue` -- list queue or delete item.
+fn handle_queue(state: AppState, params: ApiParams) -> Json<serde_json::Value> {
+    let conn = state.db.lock();
+
+    // Delete action.
+    if params.name.as_deref() == Some("delete") || params.name.as_deref() == Some("purge") {
+        if let Some(value) = &params.value {
+            let id = match Uuid::parse_str(value) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Json(
+                        serde_json::to_value(SimpleResponse {
+                            status: false,
+                            error: Some("invalid id".to_string()),
+                        })
+                        .unwrap(),
+                    );
+                }
+            };
+            if let Err(e) = queue_items::delete(&conn, id) {
+                warn!(error = %e, %id, "failed to delete queue item");
+                return Json(
+                    serde_json::to_value(SimpleResponse {
+                        status: false,
+                        error: Some(format!("database error: {e}")),
+                    })
+                    .unwrap(),
+                );
+            }
+        }
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: true,
+                error: None,
+            })
+            .unwrap(),
+        );
+    }
+
+    // List queue with pagination.
+    let total = match queue_items::count(&conn) {
+        Ok(c) => c as usize,
+        Err(e) => {
+            warn!(error = %e, "failed to count queue");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("database error: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    };
+    let offset = params.start.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50);
+    let items = match queue_items::list_paginated(&conn, offset, limit) {
+        Ok(items) => items,
+        Err(e) => {
+            warn!(error = %e, "failed to list queue");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("database error: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    };
+    let qs = state.queue_status.borrow();
+    let slots: Vec<QueueSlot> = items
+        .iter()
+        .map(|item| {
+            let mb = format!("{:.2}", item.total_segment_bytes as f64 / 1_048_576.0);
+            let status = if qs.active_ids.contains(&item.id) {
+                "Processing".to_string()
+            } else {
+                "Queued".to_string()
+            };
+            QueueSlot {
+                nzo_id: item.id.to_string(),
+                filename: item.job_name.clone(),
+                cat: item.category.clone(),
+                priority: priority_to_string(item.priority),
+                status,
+                mb,
+                mbleft: "0.00".to_string(),
+                percentage: "100".to_string(),
+                timeleft: "0:00:00".to_string(),
+            }
+        })
+        .collect();
+    drop(qs);
+
+    let page_count = slots.len();
+    // SABnzbd-compatible queue with all fields Sonarr expects
+    Json(serde_json::json!({
+        "queue": {
+            "status": if total > 0 { "Downloading" } else { "Idle" },
+            "paused": false,
+            "noofslots": page_count,
+            "noofslots_total": total,
+            "speed": "0",
+            "kbpersec": "0.00",
+            "size": "0 B",
+            "sizeleft": "0 B",
+            "mbleft": "0.00",
+            "mb": "0.00",
+            "timeleft": "0:00:00",
+            "eta": "unknown",
+            "diskspace1": "999.99",
+            "diskspacetotal1": "999.99",
+            "slots": slots.iter().map(|s| serde_json::to_value(s).unwrap()).collect::<Vec<_>>(),
+        }
+    }))
+}
+
+/// Handle `mode=history` -- list history or delete item.
+fn handle_history(state: AppState, params: ApiParams) -> Json<serde_json::Value> {
+    let conn = state.db.lock();
+
+    // Delete action.
+    if params.name.as_deref() == Some("delete") {
+        if let Some(value) = &params.value {
+            if value == "all" {
+                if let Err(e) = history_items::delete_all(&conn) {
+                    warn!(error = %e, "failed to clear history");
+                    return Json(
+                        serde_json::to_value(SimpleResponse {
+                            status: false,
+                            error: Some(format!("database error: {e}")),
+                        })
+                        .unwrap(),
+                    );
+                }
+            } else {
+                let id = match Uuid::parse_str(value) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        return Json(
+                            serde_json::to_value(SimpleResponse {
+                                status: false,
+                                error: Some("invalid id".to_string()),
+                            })
+                            .unwrap(),
+                        );
+                    }
+                };
+                if let Err(e) = history_items::delete(&conn, id) {
+                    warn!(error = %e, %id, "failed to delete history item");
+                    return Json(
+                        serde_json::to_value(SimpleResponse {
+                            status: false,
+                            error: Some(format!("database error: {e}")),
+                        })
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: true,
+                error: None,
+            })
+            .unwrap(),
+        );
+    }
+
+    // When specific nzo_ids are requested, look them up directly so pagination
+    // can't hide the item. Otherwise use normal paginated listing.
+    let (items, total) = if let Some(ref nzo_ids_str) = params.nzo_ids {
+        let ids: Vec<uuid::Uuid> = nzo_ids_str
+            .split(',')
+            .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
+            .collect();
+        let found: Vec<_> = ids
+            .iter()
+            .filter_map(|id| history_items::get_by_id(&conn, *id).ok().flatten())
+            .collect();
+        let len = found.len();
+        (found, len)
+    } else {
+        let offset = params.start.unwrap_or(0);
+        let limit = params.limit.unwrap_or(50);
+        let items = match history_items::list(&conn, offset, limit) {
+            Ok(items) => items,
+            Err(e) => {
+                warn!(error = %e, "failed to list history");
+                return Json(
+                    serde_json::to_value(SimpleResponse {
+                        status: false,
+                        error: Some(format!("database error: {e}")),
+                    })
+                    .unwrap(),
+                );
+            }
+        };
+        let total = match history_items::count(&conn) {
+            Ok(c) => c as usize,
+            Err(e) => {
+                warn!(error = %e, "failed to count history");
+                return Json(
+                    serde_json::to_value(SimpleResponse {
+                        status: false,
+                        error: Some(format!("database error: {e}")),
+                    })
+                    .unwrap(),
+                );
+            }
+        };
+        (items, total)
+    };
+
+    // `category` (Usenet-Ultimate) and `cat` (SABnzbd standard) both filter history.
+    let cat_filter: Option<String> = params.category.or(params.cat).map(|s| s.to_lowercase());
+
+    let slots: Vec<HistorySlot> = items
+        .iter()
+        .filter(|item| {
+            cat_filter
+                .as_ref()
+                .is_none_or(|f| item.category.eq_ignore_ascii_case(f))
+        })
+        .map(|item| {
+            let status = match item.download_status {
+                DownloadStatus::Completed => "Completed",
+                DownloadStatus::Failed => "Failed",
+            };
+            let storage = item
+                .download_dir_id
+                .and_then(|id| dav_items::get_by_id(&conn, id).ok().flatten())
+                .map(|dav| dav.path)
+                .unwrap_or_default();
+            HistorySlot {
+                nzo_id: item.id.to_string(),
+                name: item.job_name.clone(),
+                category: item.category.clone(),
+                status: status.to_string(),
+                fail_message: item.fail_message.clone().unwrap_or_default(),
+                bytes: item.total_segment_bytes,
+                download_time: item.download_time_seconds,
+                completed: item.created_at.and_utc().timestamp(),
+                storage,
+            }
+        })
+        .collect();
+
+    Json(
+        serde_json::to_value(HistoryResponse {
+            history: HistoryData {
+                noofslots: total,
+                slots,
+            },
+        })
+        .unwrap(),
+    )
+}
+
+/// Handle `mode=retry` -- re-queue a history item.
+fn handle_retry(state: AppState, params: ApiParams) -> Json<serde_json::Value> {
+    let Some(value) = &params.value else {
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some("value parameter (nzo_id) is required".to_string()),
+            })
+            .unwrap(),
+        );
+    };
+
+    let id = match Uuid::parse_str(value) {
+        Ok(id) => id,
+        Err(_) => {
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some("invalid id".to_string()),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    retry_history_item(&state, id)
+}
+
+/// REST endpoint: POST /api/history/{id}/retry
+pub async fn rest_retry_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let id = match Uuid::parse_str(&id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some("invalid id".to_string()),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    retry_history_item(&state, id)
+}
+
+/// Shared retry logic: look up history item, get NZB blob, re-enqueue, delete history entry.
+fn retry_history_item(state: &AppState, id: Uuid) -> Json<serde_json::Value> {
+    let conn = state.db.lock();
+
+    let history_item = match history_items::get_by_id(&conn, id) {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some("history item not found".to_string()),
+                })
+                .unwrap(),
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, %id, "failed to look up history item");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(format!("database error: {e}")),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    let blob_id = match history_item.nzb_blob_id {
+        Some(bid) => bid,
+        None => {
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some("NZB blob not available for this history item".to_string()),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    let nzb_data = match BlobStore::get_nzb_blob(&conn, blob_id) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(error = %e, %blob_id, "NZB blob missing for retry");
+            return Json(
+                serde_json::to_value(SimpleResponse {
+                    status: false,
+                    error: Some(
+                        "NZB blob has been cleaned up and is no longer available".to_string(),
+                    ),
+                })
+                .unwrap(),
+            );
+        }
+    };
+
+    let new_id = Uuid::new_v4();
+    let queue_item = QueueItem {
+        id: new_id,
+        created_at: Utc::now().naive_utc(),
+        file_name: history_item.file_name.clone(),
+        job_name: history_item.job_name.clone(),
+        nzb_file_size: nzb_data.len() as i64,
+        total_segment_bytes: history_item.total_segment_bytes,
+        category: history_item.category.clone(),
+        priority: 0,
+        post_processing: -1,
+        pause_until: None,
+    };
+
+    if let Err(e) = BlobStore::put_nzb_blob(&conn, new_id, &nzb_data) {
+        warn!(error = %e, "failed to store NZB blob for retry");
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some(format!("failed to store NZB: {e}")),
+            })
+            .unwrap(),
+        );
+    }
+
+    if let Err(e) = queue_items::insert(&conn, &queue_item) {
+        warn!(error = %e, "failed to insert retried queue item");
+        return Json(
+            serde_json::to_value(SimpleResponse {
+                status: false,
+                error: Some(format!("failed to enqueue: {e}")),
+            })
+            .unwrap(),
+        );
+    }
+
+    if let Err(e) = history_items::delete(&conn, id) {
+        warn!(error = %e, %id, "failed to delete history item after retry");
+        // Non-fatal: item is re-queued, history entry is stale but harmless.
+    }
+
+    info!(
+        old_nzo_id = %id,
+        new_nzo_id = %new_id,
+        job_name = %queue_item.job_name,
+        "history item retried and re-queued"
+    );
+
+    Json(
+        serde_json::to_value(AddFileResponse {
+            status: true,
+            nzo_ids: vec![new_id.to_string()],
+        })
+        .unwrap(),
+    )
+}
+
+/// Convert integer priority to SABnzbd string.
+fn priority_to_string(priority: i32) -> String {
+    match priority {
+        p if p <= 0 => "Low".to_string(),
+        1 => "Normal".to_string(),
+        2 => "High".to_string(),
+        _ => "Force".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, post};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn test_state() -> AppState {
+        let conn = nzbdav_core::db::open(":memory:").unwrap();
+        let db = Arc::new(parking_lot::Mutex::new(conn));
+        let sqlite_db = nzbdav_core::sqlite_db::SqliteDavDatabase::new(Arc::clone(&db));
+        nzbdav_core::seed::seed_root_items(&sqlite_db)
+            .await
+            .unwrap();
+        let config = nzbdav_core::config::ConfigManager::new();
+        let provider = Arc::new(nzbdav_stream::UsenetArticleProvider::new(vec![]));
+        let (_, queue_status) =
+            tokio::sync::watch::channel(crate::queue_manager::QueueStatus::default());
+        AppState {
+            db,
+            config,
+            provider,
+            version: "0.1.0-test",
+            queue_status,
+        }
+    }
+
+    async fn test_router() -> Router {
+        let state = test_state().await;
+        Router::new()
+            .route("/api", get(sab_api).post(sab_api))
+            .route("/api/history/{id}/retry", post(rest_retry_history))
+            .with_state(state)
+    }
+
+    async fn get_json(uri: &str) -> serde_json::Value {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_version() {
+        let v = get_json("/api?mode=version").await;
+        // Reports SABnzbd-compatible version (4.0.0) for Sonarr/Radarr compatibility
+        assert_eq!(v["version"], "4.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_status() {
+        let v = get_json("/api?mode=status").await;
+        // fullstatus wraps in a "status" object for SABnzbd compatibility
+        assert_eq!(v["status"]["version"], "4.0.0");
+        assert_eq!(v["status"]["paused"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fullstatus() {
+        let v = get_json("/api?mode=fullstatus").await;
+        assert!(v["status"].is_object());
+        assert_eq!(v["status"]["version"], "4.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_get_cats_empty() {
+        let v = get_json("/api?mode=get_cats").await;
+        let cats = v["categories"].as_array().unwrap();
+        assert!(cats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_queue_empty() {
+        let v = get_json("/api?mode=queue").await;
+        assert_eq!(v["queue"]["noofslots"], 0);
+        assert_eq!(v["queue"]["noofslots_total"], 0);
+        assert_eq!(v["queue"]["status"], "Idle");
+        assert!(v["queue"]["slots"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_history_empty() {
+        let v = get_json("/api?mode=history").await;
+        assert_eq!(v["history"]["noofslots"], 0);
+        assert!(v["history"]["slots"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_mode() {
+        let v = get_json("/api?mode=bogus").await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_addurl_missing_url() {
+        let v = get_json("/api?mode=addurl").await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("URL is required"));
+    }
+
+    #[tokio::test]
+    async fn test_get_config() {
+        let v = get_json("/api?mode=get_config").await;
+        assert!(v["config"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_addfile_no_multipart() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::post("/api?mode=addfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("multipart"));
+    }
+
+    #[test]
+    fn test_priority_to_string_values() {
+        assert_eq!(priority_to_string(-1), "Low");
+        assert_eq!(priority_to_string(0), "Low");
+        assert_eq!(priority_to_string(1), "Normal");
+        assert_eq!(priority_to_string(2), "High");
+        assert_eq!(priority_to_string(3), "Force");
+        assert_eq!(priority_to_string(100), "Force");
+    }
+
+    #[tokio::test]
+    async fn test_queue_delete_nonexistent_returns_success() {
+        let random_id = Uuid::new_v4();
+        let v = get_json(&format!("/api?mode=queue&name=delete&value={random_id}")).await;
+        assert_eq!(v["status"], true);
+        assert!(v.get("error").is_none() || v["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_queue_delete_invalid_uuid_returns_json_error() {
+        let v = get_json("/api?mode=queue&name=delete&value=not-a-uuid").await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("invalid id"));
+    }
+
+    #[tokio::test]
+    async fn test_history_delete_nonexistent_returns_success() {
+        let random_id = Uuid::new_v4();
+        let v = get_json(&format!("/api?mode=history&name=delete&value={random_id}")).await;
+        assert_eq!(v["status"], true);
+        assert!(v.get("error").is_none() || v["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_history_delete_invalid_uuid_returns_json_error() {
+        let v = get_json("/api?mode=history&name=delete&value=not-a-uuid").await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("invalid id"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_missing_value() {
+        let v = get_json("/api?mode=retry").await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("value"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_invalid_uuid() {
+        let v = get_json("/api?mode=retry&value=garbage").await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("invalid id"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_nonexistent_history_item() {
+        let random_id = Uuid::new_v4();
+        let v = get_json(&format!("/api?mode=retry&value={random_id}")).await;
+        assert_eq!(v["status"], false);
+        assert!(v["error"].as_str().unwrap().contains("not found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // enqueue_nzb: job_name is derived from the filename passed in (Bug #3 /
+    // nzbname regression)
+    // -----------------------------------------------------------------------
+
+    fn minimal_nzb() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@example.com" date="1234567890" subject="test.rar (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment number="1" bytes="768000">article1@example.com</segment>
+    </segments>
+  </file>
+</nzb>"#
+    }
+
+    /// `enqueue_nzb` must store the job_name as the filename stem (minus .nzb).
+    /// In production, `handle_addurl` resolves this to the `nzbname` param value
+    /// before calling `enqueue_nzb`, so testing `enqueue_nzb` directly proves
+    /// that whatever filename is passed becomes the job_name.
+    #[tokio::test]
+    async fn test_enqueue_nzb_stores_job_name_from_filename() {
+        let state = test_state().await;
+        let result = enqueue_nzb(
+            state.clone(),
+            "My.Cool.Movie.nzb",
+            minimal_nzb(),
+            "movies",
+            0,
+            None,
+        );
+        let v: serde_json::Value = result.0;
+        assert!(
+            v["status"].as_bool().unwrap_or(false),
+            "enqueue_nzb should succeed; got: {v}"
+        );
+        let nzo_id = v["nzo_ids"][0]
+            .as_str()
+            .expect("nzo_ids[0] must be a string");
+        assert!(!nzo_id.is_empty(), "nzo_id must not be empty");
+
+        // Verify job_name in the DB matches the filename stem.
+        let conn = state.db.lock();
+        let items = nzbdav_core::queue_items::list_paginated(&conn, 0, 10).unwrap();
+        assert_eq!(items.len(), 1, "exactly one queue item should be inserted");
+        assert_eq!(
+            items[0].job_name, "My.Cool.Movie",
+            "job_name must be the filename stem without .nzb"
+        );
+        assert_eq!(
+            items[0].id.to_string(),
+            nzo_id,
+            "nzo_id in the JSON response must match the queue item UUID (regression for Bug #1)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // history nzo_ids filter (Bug #2 regression)
+    // -----------------------------------------------------------------------
+
+    fn make_history_item_for(id: Uuid, name: &str) -> nzbdav_core::models::HistoryItem {
+        use nzbdav_core::models::DownloadStatus;
+        nzbdav_core::models::HistoryItem {
+            id,
+            created_at: chrono::Utc::now().naive_utc(),
+            file_name: format!("{name}.nzb"),
+            job_name: name.to_string(),
+            category: "movies".to_string(),
+            download_status: DownloadStatus::Completed,
+            total_segment_bytes: 1024,
+            download_time_seconds: 10,
+            fail_message: None,
+            download_dir_id: None,
+            nzb_blob_id: None,
+        }
+    }
+
+    /// When `nzo_ids` is supplied, only the matching history item must be
+    /// returned — regardless of total history size. This is how AIOStreams
+    /// polls for download completion.
+    #[tokio::test]
+    async fn test_history_nzo_ids_filter_returns_only_matching() {
+        let state = test_state().await;
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        {
+            let conn = state.db.lock();
+            nzbdav_core::history_items::insert(&conn, &make_history_item_for(id1, "Job One"))
+                .unwrap();
+            nzbdav_core::history_items::insert(&conn, &make_history_item_for(id2, "Job Two"))
+                .unwrap();
+        }
+
+        // Ask for only id1.
+        let app = Router::new()
+            .route("/api", get(sab_api).post(sab_api))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::get(format!("/api?mode=history&nzo_ids={id1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let slots = v["history"]["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 1, "only one slot should be returned");
+        assert_eq!(
+            slots[0]["nzo_id"].as_str().unwrap(),
+            id1.to_string(),
+            "returned slot must be the requested id"
+        );
+        assert_eq!(
+            slots[0]["name"].as_str().unwrap(),
+            "Job One",
+            "returned slot must be Job One"
+        );
+    }
+
+    /// Regression test for Bug #1: after `move_to_history()`, the history item
+    /// UUID must equal the original queue item UUID so that AIOStreams can find
+    /// it by polling with the nzo_id it received at addurl time.
+    #[tokio::test]
+    async fn test_history_item_id_matches_queue_item_id() {
+        let state = test_state().await;
+        let queue_id = Uuid::new_v4();
+
+        // Simulate what queue_manager does after download: insert the history
+        // item with the SAME id as the queue item.
+        {
+            let conn = state.db.lock();
+            nzbdav_core::history_items::insert(
+                &conn,
+                &make_history_item_for(queue_id, "Downloaded.Movie"),
+            )
+            .unwrap();
+        }
+
+        // AIOStreams polls history with the id it got from addurl.
+        let app = Router::new()
+            .route("/api", get(sab_api).post(sab_api))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::get(format!("/api?mode=history&nzo_ids={queue_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let slots = v["history"]["slots"].as_array().unwrap();
+        assert_eq!(
+            slots.len(),
+            1,
+            "history item must be findable by the original queue UUID"
+        );
+        assert_eq!(slots[0]["nzo_id"].as_str().unwrap(), queue_id.to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // addfile field-name compatibility (issue #2 regression)
+    // -----------------------------------------------------------------------
+
+    fn multipart_body(field_name: &str, filename: &str, data: &[u8]) -> (String, Vec<u8>) {
+        let boundary = "testboundary123";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\nContent-Type: application/x-nzb+xml\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={boundary}"), body)
+    }
+
+    async fn post_addfile(uri: &str, field_name: &str, filename: &str) -> serde_json::Value {
+        let app = test_router().await;
+        let (ct, body) = multipart_body(field_name, filename, minimal_nzb());
+        let resp = app
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Usenet-Ultimate sends field name `nzbFile` (capital F). Must be accepted.
+    #[tokio::test]
+    async fn test_addfile_nzb_file_field_name_accepted() {
+        let v = post_addfile("/api?mode=addfile&cat=movies", "nzbFile", "Test.Movie.nzb").await;
+        assert!(
+            v["status"].as_bool().unwrap_or(false),
+            "addfile with nzbFile field must succeed; got: {v}"
+        );
+        assert!(
+            !v["nzo_ids"][0].as_str().unwrap_or("").is_empty(),
+            "nzo_ids must contain the new job UUID"
+        );
+    }
+
+    /// Standard lowercase field name must still work (UsenetStreamer).
+    #[tokio::test]
+    async fn test_addfile_lowercase_nzbfile_field_accepted() {
+        let v = post_addfile("/api?mode=addfile&cat=movies", "nzbfile", "Test.Movie.nzb").await;
+        assert!(
+            v["status"].as_bool().unwrap_or(false),
+            "addfile with nzbfile field must succeed; got: {v}"
+        );
+    }
+
+    /// When `nzbname` is provided it must override the multipart filename as the job name.
+    #[tokio::test]
+    async fn test_addfile_nzbname_overrides_multipart_filename() {
+        let state = test_state().await;
+        let (ct, body) = multipart_body("nzbFile", "raw_upload.nzb", minimal_nzb());
+        let app = Router::new()
+            .route("/api", get(sab_api).post(sab_api))
+            .route("/api/history/{id}/retry", post(rest_retry_history))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api?mode=addfile&cat=movies&nzbname=UsenetUltimate-Test")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["status"].as_bool().unwrap_or(false),
+            "addfile with nzbname must succeed; got: {v}"
+        );
+        let conn = state.db.lock();
+        let items = nzbdav_core::queue_items::list_paginated(&conn, 0, 10).unwrap();
+        assert_eq!(
+            items[0].job_name, "UsenetUltimate-Test",
+            "job_name must come from nzbname, not the multipart filename"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // history category filter (issue #2 regression)
+    // -----------------------------------------------------------------------
+
+    /// `category=` param (Usenet-Ultimate style) must filter history to that category.
+    #[tokio::test]
+    async fn test_history_category_filter() {
+        let state = test_state().await;
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        {
+            let conn = state.db.lock();
+            let mut movie = make_history_item_for(id1, "Movie");
+            movie.category = "movies".to_string();
+            let mut show = make_history_item_for(id2, "Show");
+            show.category = "tv".to_string();
+            nzbdav_core::history_items::insert(&conn, &movie).unwrap();
+            nzbdav_core::history_items::insert(&conn, &show).unwrap();
+        }
+
+        let app = Router::new()
+            .route("/api", get(sab_api).post(sab_api))
+            .route("/api/history/{id}/retry", post(rest_retry_history))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api?mode=history&category=movies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let slots = v["history"]["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 1, "category=movies must return only 1 slot");
+        assert_eq!(
+            slots[0]["category"].as_str().unwrap(),
+            "movies",
+            "returned slot must be the movies item"
+        );
+    }
+}
