@@ -6,6 +6,7 @@
 
 pub mod aes_decoder_stream;
 pub mod census;
+pub mod census_service;
 pub mod error;
 pub mod holes;
 pub mod multi_segment_stream;
@@ -22,6 +23,7 @@ pub use census::{
     CensusBackend, CensusConfig, CensusError, CensusReport, CensusTarget, CensusTrigger,
     DamageCensus, Verdict,
 };
+pub use census_service::{CensusService, is_missing_article};
 pub use error::{Result, StreamError};
 pub use holes::{
     Consult, HoleLedger, HoleRecord, HoleState, InMemoryHoleLedger, Noted, Outcome,
