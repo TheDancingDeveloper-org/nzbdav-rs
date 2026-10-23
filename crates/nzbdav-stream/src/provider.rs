@@ -38,6 +38,9 @@ pub struct YencHeaders {
 /// Backend trait used by [`UsenetArticleProvider`]. Production code uses the
 /// pool-backed impl; tests use a fake. The trait is public so integration
 /// tests in other crates can provide their own canned responses.
+// `#[async_trait]` puts `#[must_use]` on the boxed futures it returns, which
+// are already `#[must_use]`; clippy flags the macro's output, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ArticleBackend: Send + Sync + 'static {
     async fn fetch_decoded(&self, message_id: &str) -> Result<Vec<u8>>;
@@ -53,6 +56,11 @@ pub trait ArticleBackend: Send + Sync + 'static {
     /// error is a transport failure.
     async fn fetch_decoded_on_pool(&self, _pool: usize, message_id: &str) -> Result<Vec<u8>> {
         self.fetch_decoded(message_id).await
+    }
+    /// STAT on one pool. `Ok(false)` or `ArticleNotFound` stands for a 430;
+    /// any other error is a transport failure.
+    async fn stat_on_pool(&self, _pool: usize, message_id: &str) -> Result<bool> {
+        self.stat(message_id).await
     }
 }
 
@@ -421,53 +429,30 @@ impl UsenetArticleProvider {
         Arc::clone(&self.ledger)
     }
 
-    /// Check article existence via the STAT command. Returns `true` if any
-    /// server has the article.
+    /// Check article existence via the STAT command, asking each pool in
+    /// priority order. `Ok(true)` if any pool has the article, `Ok(false)`
+    /// only when every pool answered 430. A pool that failed to answer, with
+    /// none having the article, is a transport error, never "not found".
     pub async fn stat(&self, message_id: &str) -> Result<bool> {
-        if let Some(fake) = &self.fake {
-            return fake.stat(message_id).await;
-        }
-        let pools = self.load_pools();
-        let mut last_err: Option<StreamError> = None;
-
-        for (i, pool) in pools.iter().enumerate() {
-            let mut pooled = match pool.acquire().await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(pool = i, error = %e, "failed to acquire connection");
-                    last_err = Some(StreamError::NntpError(e.to_string()));
-                    continue;
+        let pools = self.pool_count();
+        let mut transport: Option<StreamError> = None;
+        for pool in 0..pools {
+            match self.stat_pool(pool, message_id).await {
+                StatAnswer::Present => return Ok(true),
+                StatAnswer::Absent => {
+                    debug!(pool, message_id, "article not found via STAT, trying next");
                 }
-            };
-
-            match pooled.conn.stat_article(message_id).await {
-                Ok(resp) => {
-                    pool.release(pooled);
-                    // Code 223 means the article exists.
-                    return Ok(resp.code == 223);
-                }
-                Err(NntpError::ArticleNotFound(_)) => {
-                    debug!(
-                        pool = i,
-                        message_id, "article not found via STAT, trying next"
-                    );
-                    pool.release(pooled);
-                    last_err = Some(StreamError::ArticleNotFound(message_id.to_string()));
-                }
-                Err(e) => {
-                    warn!(pool = i, message_id, error = %e, "nntp STAT error, discarding connection");
-                    pool.discard(pooled);
-                    last_err = Some(StreamError::NntpError(e.to_string()));
+                StatAnswer::Failed(e) => {
+                    warn!(pool, message_id, error = %e, "pool failed to answer STAT");
+                    transport = Some(e);
                 }
             }
         }
-
-        // If every server said ArticleNotFound, the article doesn't exist.
-        if matches!(last_err, Some(StreamError::ArticleNotFound(_))) {
-            return Ok(false);
+        match transport {
+            Some(e) => Err(e),
+            None if pools == 0 => Err(StreamError::AllServersExhausted(message_id.to_string())),
+            None => Ok(false),
         }
-
-        Err(last_err.unwrap_or_else(|| StreamError::AllServersExhausted(message_id.to_string())))
     }
 
     /// Number of server pools, in priority order. A fake-backed provider
@@ -510,40 +495,52 @@ impl UsenetArticleProvider {
     ///
     /// [`stat`]: Self::stat
     pub async fn stat_on_pool(&self, pool: usize, message_id: &str) -> PoolStat {
+        match self.stat_pool(pool, message_id).await {
+            StatAnswer::Present => PoolStat::Present,
+            StatAnswer::Absent => PoolStat::Absent,
+            StatAnswer::Failed(StreamError::NntpError(e)) => PoolStat::Failed(e),
+            StatAnswer::Failed(e) => PoolStat::Failed(e.to_string()),
+        }
+    }
+
+    /// STAT one article on one pool. A 430 releases the connection cleanly;
+    /// any other failure discards it.
+    async fn stat_pool(&self, pool: usize, message_id: &str) -> StatAnswer {
         if let Some(fake) = &self.fake {
             if pool >= fake.pool_count() {
-                return PoolStat::Failed(format!("no pool {pool}"));
+                return StatAnswer::Failed(StreamError::NntpError(format!("no pool {pool}")));
             }
-            return match fake.stat(message_id).await {
-                Ok(true) => PoolStat::Present,
-                Ok(false) | Err(StreamError::ArticleNotFound(_)) => PoolStat::Absent,
-                Err(e) => PoolStat::Failed(e.to_string()),
+            return match fake.stat_on_pool(pool, message_id).await {
+                Ok(true) => StatAnswer::Present,
+                Ok(false) | Err(StreamError::ArticleNotFound(_)) => StatAnswer::Absent,
+                Err(e) => StatAnswer::Failed(e),
             };
         }
 
+        let failed = |m: String| StatAnswer::Failed(StreamError::NntpError(m));
         let Some(pool_ref) = self.load_pools().get(pool).cloned() else {
-            return PoolStat::Failed(format!("pool {pool} is no longer configured"));
+            return failed(format!("pool {pool} is no longer configured"));
         };
         let mut pooled = match pool_ref.acquire().await {
             Ok(p) => p,
-            Err(e) => return PoolStat::Failed(format!("acquire: {e}")),
+            Err(e) => return failed(format!("acquire: {e}")),
         };
         match pooled.conn.stat_article(message_id).await {
             Ok(resp) => {
                 pool_ref.release(pooled);
                 if resp.code == 223 {
-                    PoolStat::Present
+                    StatAnswer::Present
                 } else {
-                    PoolStat::Failed(format!("unexpected STAT response {}", resp.code))
+                    failed(format!("unexpected STAT response {}", resp.code))
                 }
             }
             Err(NntpError::ArticleNotFound(_)) => {
                 pool_ref.release(pooled);
-                PoolStat::Absent
+                StatAnswer::Absent
             }
             Err(e) => {
                 pool_ref.discard(pooled);
-                PoolStat::Failed(e.to_string())
+                failed(e.to_string())
             }
         }
     }
@@ -618,6 +615,14 @@ pub enum PoolStat {
     /// The pool did not answer: connect, auth, protocol error or timeout.
     /// Never evidence that the article is missing.
     Failed(String),
+}
+
+/// One pool's answer to a STAT, keeping the transport error.
+enum StatAnswer {
+    Present,
+    /// 430.
+    Absent,
+    Failed(StreamError),
 }
 
 /// One pool's answer to a fetch.
@@ -801,6 +806,13 @@ mod tests {
                 }
             }
         }
+        async fn stat_on_pool(&self, pool: usize, message_id: &str) -> Result<bool> {
+            match self.fetch_decoded_on_pool(pool, message_id).await {
+                Ok(_) => Ok(true),
+                Err(StreamError::ArticleNotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
     }
 
     fn provider(backend: &Arc<Scripted>) -> Arc<UsenetArticleProvider> {
@@ -962,17 +974,75 @@ mod tests {
         assert_eq!(provider.ledger().state("a@x"), Some(HoleState::Provisional));
     }
 
-    /// `stat` folds a 430 everywhere into `Ok(false)` but surfaces a
-    /// transport failure as `Err`.
+    /// `stat_on_pool` keeps a 430 and a transport failure apart.
     #[tokio::test]
     async fn stat_on_pool_keeps_430_and_transport_apart() {
-        let backend = Scripted::new(1, |_, _| Reply::Body);
+        let backend = Scripted::new(3, |pool, _| match pool {
+            0 => Reply::Body,
+            1 => Reply::Refused,
+            _ => Reply::Transport,
+        });
         let provider = provider(&backend);
         assert_eq!(provider.stat_on_pool(0, "a@x").await, PoolStat::Present);
+        assert_eq!(provider.stat_on_pool(1, "a@x").await, PoolStat::Absent);
         assert!(matches!(
-            provider.stat_on_pool(1, "a@x").await,
+            provider.stat_on_pool(2, "a@x").await,
             PoolStat::Failed(_)
         ));
+        assert!(matches!(
+            provider.stat_on_pool(3, "a@x").await,
+            PoolStat::Failed(_)
+        ));
+    }
+
+    /// Multi-pool `stat`: a transport failure on any pool, with no pool
+    /// holding the article, is `Err`, whichever pool failed.
+    #[tokio::test]
+    async fn stat_transport_failure_on_any_pool_is_an_error() {
+        for failing in 0..2 {
+            let backend = Scripted::new(2, move |pool, _| {
+                if pool == failing {
+                    Reply::Transport
+                } else {
+                    Reply::Refused
+                }
+            });
+            let provider = provider(&backend);
+            let err = provider.stat("a@x").await.unwrap_err();
+            assert!(
+                matches!(err, StreamError::NntpError(_)),
+                "pool {failing} failing: {err}"
+            );
+            assert_eq!(backend.calls(), 2, "every pool is asked");
+        }
+    }
+
+    /// Multi-pool `stat`: `Ok(false)` only when every pool answered 430.
+    #[tokio::test]
+    async fn stat_every_pool_430_is_not_found() {
+        let backend = Scripted::new(3, |_, _| Reply::Refused);
+        let provider = provider(&backend);
+        assert!(!provider.stat("a@x").await.unwrap());
+        assert_eq!(backend.calls(), 3);
+    }
+
+    /// Multi-pool `stat`: any pool holding the article is `Ok(true)`, even
+    /// after other pools refused or failed to answer.
+    #[tokio::test]
+    async fn stat_any_pool_holding_it_is_found() {
+        let backend = Scripted::new(3, |pool, _| match pool {
+            0 => Reply::Transport,
+            1 => Reply::Refused,
+            _ => Reply::Body,
+        });
+        assert!(provider(&backend).stat("a@x").await.unwrap());
+
+        let backend = Scripted::new(3, |pool, _| match pool {
+            0 => Reply::Body,
+            _ => Reply::Transport,
+        });
+        assert!(provider(&backend).stat("a@x").await.unwrap());
+        assert_eq!(backend.calls(), 1, "stops at the first pool that has it");
     }
 
     #[test]

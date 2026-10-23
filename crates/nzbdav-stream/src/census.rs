@@ -69,6 +69,9 @@ impl Default for CensusConfig {
 }
 
 /// What the census needs from the server pools.
+// `#[async_trait]` puts `#[must_use]` on the boxed futures it returns, which
+// are already `#[must_use]`; clippy flags the macro's output, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CensusBackend: Send + Sync {
     /// Pools in priority order.
@@ -339,9 +342,16 @@ impl DamageCensus {
 
         let ids = surveyed_ids(target);
         let servers = self.servers();
-        let (states, pool_failures) = self.settle(&ids, &servers).await;
+        let (states, fresh, pool_failures) = self.settle(&ids, &servers).await;
 
-        let mut report = assess(target, trigger, &states, self.ledger.as_ref(), &servers);
+        let mut report = assess(
+            target,
+            trigger,
+            &states,
+            &fresh,
+            self.ledger.as_ref(),
+            &servers,
+        );
         report.pool_failures = pool_failures;
 
         let clean = matches!(
@@ -375,11 +385,17 @@ impl DamageCensus {
     }
 
     /// Settle every id, from the cache where fresh, else across the pools.
+    /// Also returns the ids a STAT pass settled in this run, as opposed to
+    /// the cache.
     async fn settle(
         &self,
         ids: &[String],
         servers: &[String],
-    ) -> (HashMap<String, ArticleState>, Vec<PoolFailures>) {
+    ) -> (
+        HashMap<String, ArticleState>,
+        HashSet<String>,
+        Vec<PoolFailures>,
+    ) {
         let mut states = HashMap::with_capacity(ids.len());
         let mut pending = Vec::new();
         {
@@ -444,6 +460,7 @@ impl DamageCensus {
         }
 
         let now = Instant::now();
+        let fresh: HashSet<String> = evidence.keys().cloned().collect();
         let mut cache = self.cache.lock();
         for (id, ev) in evidence {
             let state = if ev.present {
@@ -475,7 +492,7 @@ impl DamageCensus {
                 self.ledger.note(id, &Outcome::Present, servers);
             }
         }
-        (states, failures)
+        (states, fresh, failures)
     }
 
     /// STAT `ids` on one pool, pipelined; answers come back in `ids` order.
@@ -550,6 +567,7 @@ fn assess(
     target: &CensusTarget,
     trigger: CensusTrigger,
     states: &HashMap<String, ArticleState>,
+    fresh: &HashSet<String>,
     ledger: &dyn HoleLedger,
     servers: &[String],
 ) -> CensusReport {
@@ -573,14 +591,22 @@ fn assess(
             }
             ArticleState::Missing => {
                 missing_ids.push(id.clone());
-                // Every pool answered 430: one refusal per server.
-                let mut hole = None;
-                for server in servers {
-                    let refused = Outcome::Refused {
-                        server: server.clone(),
-                    };
-                    hole = ledger.note(id, &refused, servers).state;
-                }
+                // Only a live STAT pass is evidence: every pool answered 430
+                // just now, one refusal per server. A miss replayed from the
+                // cache is the same 430 again and must not confirm a hole, so
+                // it is reported with whatever the ledger already holds.
+                let hole = if fresh.contains(id) {
+                    let mut hole = None;
+                    for server in servers {
+                        let refused = Outcome::Refused {
+                            server: server.clone(),
+                        };
+                        hole = ledger.note(id, &refused, servers).state;
+                    }
+                    hole
+                } else {
+                    ledger.state(id)
+                };
                 match hole.unwrap_or(HoleState::Provisional) {
                     HoleState::Confirmed => Loss::Certain,
                     HoleState::Provisional => {
@@ -917,6 +943,32 @@ mod tests {
         assert_eq!(report.provisional_ids, vec!["x"]);
         assert_eq!((report.damaged, report.uncertain), (0, 1));
         assert_eq!(report.verdict, None);
+        assert_eq!(ledger.state("x"), Some(HoleState::Provisional));
+    }
+
+    /// A miss replayed from the census cache is not a second refusal: two
+    /// censuses within the cache window, further apart than the confirm
+    /// delay, leave the hole provisional and ask the pools once.
+    #[tokio::test]
+    async fn cached_misses_do_not_confirm_a_hole() {
+        let ledger = Arc::new(InMemoryHoleLedger::new(Duration::from_millis(20)));
+        let (census, backend) = census(FakePools::new(2), ledger.clone());
+        let target = CensusTarget {
+            key: "k".into(),
+            files: vec![file("f", &["x"], 10)],
+            recovery: None,
+        };
+        let first = census.run(&target, CensusTrigger::Operator).await.unwrap();
+        assert_eq!(first.provisional_ids, vec!["x"]);
+        assert_eq!(ledger.state("x"), Some(HoleState::Provisional));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let calls = backend.calls.lock().len();
+        let second = census.run(&target, CensusTrigger::Operator).await.unwrap();
+        assert_eq!(backend.calls.lock().len(), calls, "served from the cache");
+        assert_eq!(second.missing_ids, vec!["x"]);
+        assert_eq!(second.provisional_ids, vec!["x"]);
+        assert_eq!((second.damaged, second.uncertain), (0, 1));
         assert_eq!(ledger.state("x"), Some(HoleState::Provisional));
     }
 
