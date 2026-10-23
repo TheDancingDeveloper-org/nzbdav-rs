@@ -1,5 +1,6 @@
 //! `DatabaseStore` — WebDAV storage backed by `DavDatabase` + Usenet streaming.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -243,7 +244,7 @@ impl DatabaseStore {
             if let Some(blob_id) = existing.nzb_blob_id {
                 let _ = self.db.delete_nzb_blob(blob_id).await;
             }
-            self.db.delete_dav_item(existing.id).await?;
+            self.delete_item(&existing).await?;
         }
 
         let blob_id = Uuid::new_v4();
@@ -271,11 +272,43 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Delete an item and, via CASCADE, its children, with the PAR2 patches,
+    /// hole records and verdicts of every release (history entry) they
+    /// belong to, so deleted items stop holding the patch budget.
+    async fn delete_item(&self, item: &DavItem) -> Result<()> {
+        let releases = match self.provider.patches() {
+            Some(_) => self.releases_under(item).await?,
+            None => HashSet::new(),
+        };
+        self.db.delete_dav_item(item.id).await?;
+        if let Some(patches) = self.provider.patches() {
+            for release in releases {
+                if patches.drop_release(release) {
+                    debug!(%release, path = %item.path, "dropped patches of deleted item");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// History entries of an item and everything under it.
+    async fn releases_under(&self, item: &DavItem) -> Result<HashSet<Uuid>> {
+        let mut releases = HashSet::new();
+        let mut pending = vec![item.clone()];
+        while let Some(item) = pending.pop() {
+            releases.extend(item.history_item_id);
+            if item.item_type == ItemType::Directory {
+                pending.extend(self.db.get_dav_children(item.id).await?);
+            }
+        }
+        Ok(releases)
+    }
+
     /// Delete an item (and its children via CASCADE).
     pub async fn delete(&self, path: &str) -> Result<()> {
         // Check for real item first.
         if let Some(item) = self.db.get_dav_item_by_path(path).await? {
-            self.db.delete_dav_item(item.id).await?;
+            self.delete_item(&item).await?;
             debug!(path, "DELETE complete");
             return Ok(());
         }
@@ -360,7 +393,7 @@ impl DatabaseStore {
 
         // Delete anything already at the destination.
         if let Some(existing) = self.db.get_dav_item_by_path(to).await? {
-            self.db.delete_dav_item(existing.id).await?;
+            self.delete_item(&existing).await?;
         }
 
         self.db
@@ -390,7 +423,7 @@ impl DatabaseStore {
 
         // Delete anything already at the destination.
         if let Some(existing) = self.db.get_dav_item_by_path(to).await? {
-            self.db.delete_dav_item(existing.id).await?;
+            self.delete_item(&existing).await?;
         }
 
         let copy = DavItem {

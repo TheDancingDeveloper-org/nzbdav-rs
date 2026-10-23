@@ -397,3 +397,109 @@ async fn test_propfind_hrefs_include_mount_prefix() {
         "hrefs must not contain path traversal; got:\n{xml}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DELETE drops PAR2 patches
+// ---------------------------------------------------------------------------
+
+/// A provider whose patch store, on disk, holds a span and a hole record
+/// for each of `releases`.
+async fn provider_with_patches(
+    dir: &std::path::Path,
+    releases: &[Uuid],
+) -> (
+    std::sync::Arc<nzbdav_stream::UsenetArticleProvider>,
+    std::sync::Arc<nzbdav_stream::PatchStore>,
+) {
+    use nzbdav_stream::census::{ArticleSpan, CensusFile};
+    use nzbdav_stream::{HoleRecord, HoleState, PatchStamp, PatchStore, UsenetArticleProvider};
+
+    let store = std::sync::Arc::new(PatchStore::open(dir, 1 << 20).unwrap());
+    for (i, release) in releases.iter().enumerate() {
+        let file = CensusFile {
+            name: format!("r{i}.rar"),
+            articles: vec![ArticleSpan {
+                message_id: format!("r{i}@test"),
+                offset: 0,
+                len: 100,
+            }],
+        };
+        let stamp = PatchStamp {
+            nzb_blob_id: None,
+            server_fingerprint: "s".into(),
+        };
+        store
+            .insert(*release, &stamp, &file, 0, vec![i as u8; 100])
+            .await
+            .unwrap();
+        let now = tokio::time::Instant::now();
+        let hole = HoleRecord {
+            message_id: format!("r{i}@test"),
+            state: HoleState::Confirmed,
+            refused_by: vec!["s".into()],
+            unreachable: vec![],
+            first_refused_at: now,
+            confirmed_at: Some(now),
+            expires_at: Some(now + std::time::Duration::from_secs(3600)),
+            server_fingerprint: "s".into(),
+        };
+        store.record_holes(*release, &stamp, &[hole]).unwrap();
+    }
+    let provider = UsenetArticleProvider::new(vec![]).with_patches(store.clone());
+    (std::sync::Arc::new(provider), store)
+}
+
+/// A WebDAV DELETE of a release's folder drops the patches and hole
+/// records of the releases under it, on disk too, and frees their budget;
+/// other releases keep theirs. Deleting a single file drops its release.
+#[tokio::test]
+async fn test_delete_drops_patches_of_deleted_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let (provider, store) = provider_with_patches(dir.path(), &[r1, r2]).await;
+    let before = store.totals();
+    assert_eq!(before.releases, 2);
+
+    let db = seeded_db().await;
+    let content_id = db.inner.read().await.items.get("/content/").unwrap().id;
+    // Only the items under the folder carry the history entry.
+    let release_dir = make_dir_item("Release", "/content/Release/", content_id);
+    let mut sub = make_dir_item("Sub", "/content/Release/Sub/", release_dir.id);
+    sub.history_item_id = Some(r1);
+    let mut nested = make_nzb_file_item(
+        "a.mkv",
+        "/content/Release/Sub/a.mkv",
+        sub.id,
+        100,
+        Uuid::new_v4(),
+    );
+    nested.history_item_id = Some(r1);
+    let mut other = make_nzb_file_item("b.mkv", "/content/b.mkv", content_id, 100, Uuid::new_v4());
+    other.history_item_id = Some(r2);
+    for item in [release_dir, sub, nested, other] {
+        db.seed_item(item).await;
+    }
+    let router = common::test_router_with_provider(db, provider, 0);
+
+    let (status, _, _) = send_dav(&router, "DELETE", "/content/Release/", vec![], None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(store.releases(), vec![r2]);
+    assert!(store.holes(r1).is_empty());
+    assert!(store.read_article("r0@test").await.is_none());
+    assert!(!dir.path().join(r1.to_string()).exists());
+    let after = store.totals();
+    assert_eq!(after.disk_bytes, before.disk_bytes - 100);
+    assert!(after.index_bytes < before.index_bytes);
+
+    let (status, _, _) = send_dav(&router, "DELETE", "/content/b.mkv", vec![], None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(store.releases().is_empty());
+    assert_eq!(store.totals().disk_bytes, 0);
+    assert_eq!(store.totals().index_bytes, 0);
+    assert!(!dir.path().join(r2.to_string()).exists());
+
+    // Nothing comes back on the next start.
+    drop(store);
+    let reopened = nzbdav_stream::PatchStore::open(dir.path(), 1 << 20).unwrap();
+    assert!(reopened.releases().is_empty());
+}

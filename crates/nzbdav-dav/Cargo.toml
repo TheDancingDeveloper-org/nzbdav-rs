@@ -31,6 +31,7 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true, features = ["util"] }
 async-trait = { workspace = true }
 http-body-util = "0.1"
+tempfile = "3"
 
 [lints]
 workspace = true

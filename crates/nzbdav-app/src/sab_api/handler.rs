@@ -525,6 +525,9 @@ fn handle_history(state: AppState, params: ApiParams) -> Json<serde_json::Value>
     if params.name.as_deref() == Some("delete") {
         if let Some(value) = &params.value {
             if value == "all" {
+                if let Some(patches) = state.provider.patches() {
+                    patches.clear();
+                }
                 if let Err(e) = history_items::delete_all(&conn) {
                     warn!(error = %e, "failed to clear history");
                     return Json(
@@ -548,6 +551,9 @@ fn handle_history(state: AppState, params: ApiParams) -> Json<serde_json::Value>
                         );
                     }
                 };
+                if let Some(patches) = state.provider.patches() {
+                    patches.drop_release(id);
+                }
                 if let Err(e) = history_items::delete(&conn, id) {
                     warn!(error = %e, %id, "failed to delete history item");
                     return Json(
@@ -800,6 +806,9 @@ fn retry_history_item(state: &AppState, id: Uuid) -> Json<serde_json::Value> {
         );
     }
 
+    if let Some(patches) = state.provider.patches() {
+        patches.drop_release(id);
+    }
     if let Err(e) = history_items::delete(&conn, id) {
         warn!(error = %e, %id, "failed to delete history item after retry");
         // Non-fatal: item is re-queued, history entry is stale but harmless.

@@ -78,6 +78,14 @@ impl ConfigManager {
             .unwrap_or(40)
     }
 
+    /// Budget of the PAR2 patch store in MiB (`par2_patch_cache_mb`): `-1`
+    /// keeps patches in memory only, `0` turns the store off.
+    pub fn get_par2_patch_cache_mb(&self) -> i64 {
+        self.get("repair.par2-patch-cache-mb")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(512)
+    }
+
     pub fn get_categories(&self) -> Vec<String> {
         self.get_or_default("api.categories", "")
             .split(',')

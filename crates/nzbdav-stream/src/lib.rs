@@ -12,6 +12,7 @@ pub mod holes;
 pub mod multi_segment_stream;
 pub mod multipart_file_stream;
 pub mod nzb_file_stream;
+pub mod patches;
 pub mod prioritized_semaphore;
 pub mod provider;
 pub mod recovery_set;
@@ -26,12 +27,13 @@ pub use census::{
 pub use census_service::{CensusService, is_missing_article};
 pub use error::{Result, StreamError};
 pub use holes::{
-    Consult, HoleLedger, HoleRecord, HoleState, InMemoryHoleLedger, Noted, Outcome,
+    Consult, HoleLedger, HoleRecord, HoleState, InMemoryHoleLedger, Noted, Outcome, StoredHole,
     server_fingerprint,
 };
 pub use multi_segment_stream::MultiSegmentStream;
 pub use multipart_file_stream::DavMultipartFileStream;
 pub use nzb_file_stream::NzbFileStream;
+pub use patches::{PatchError, PatchStamp, PatchStore, PatchTotals, ReleaseVerdict};
 pub use prioritized_semaphore::{PermitTier, PrioritizedPermit, PrioritizedSemaphore};
 pub use provider::{HoleConfig, PoolStat, UsenetArticleProvider, YencHeaders};
 pub use recovery_set::{census_files, load_recovery_sets};

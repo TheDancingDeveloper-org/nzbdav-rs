@@ -93,7 +93,14 @@ impl MultiSegmentStream {
                             std::future::pending::<()>().await;
                         }
                     };
-                    p.fetch_decoded_promotable(&mid, promote).await
+                    match p.fetch_decoded_promotable(&mid, promote).await {
+                        // A confirmed hole the repair job rebuilt.
+                        Err(StreamError::ArticleNotFound(e)) => match p.patched(&mid).await {
+                            Some(bytes) => Ok(bytes),
+                            None => Err(StreamError::ArticleNotFound(e)),
+                        },
+                        other => other,
+                    }
                 })
             };
 
@@ -216,6 +223,218 @@ mod tests {
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, original);
+    }
+
+    /// A provider over a 4-segment file whose segment 1 every server
+    /// refuses, confirming holes on the first refusal, with `patches`.
+    fn holed_provider(
+        patches: Option<Arc<crate::patches::PatchStore>>,
+    ) -> (
+        Arc<UsenetArticleProvider>,
+        Vec<String>,
+        Vec<u8>,
+        Arc<MockArticleBackend>,
+    ) {
+        let data: Vec<u8> = (0..4096u32).map(|n| (n % 251) as u8).collect();
+        let parts: Vec<(u32, u64, usize)> = (0..4)
+            .map(|i| (i as u32 + 1, i as u64 * 1024, 1024))
+            .collect();
+        let articles = build_yenc_articles("h.bin", &data, &parts);
+        let mids: Vec<String> = (0..4).map(|i| format!("h{i}@t.test")).collect();
+        let mut backend = MockArticleBackend::new();
+        for (i, (mid, art)) in mids.iter().zip(articles).enumerate() {
+            if i != 1 {
+                backend.add(mid.clone(), art);
+            }
+        }
+        let backend = Arc::new(backend);
+        let mut provider = UsenetArticleProvider::with_fake(Arc::clone(&backend) as _)
+            .with_ledger(Arc::new(crate::holes::InMemoryHoleLedger::new(
+                Duration::ZERO,
+            )))
+            .with_hole_config(crate::provider::HoleConfig {
+                confirm_delay: Duration::ZERO,
+                confirm_fetch: Duration::from_secs(5),
+            });
+        if let Some(p) = patches {
+            provider = provider.with_patches(p);
+        }
+        (Arc::new(provider), mids, data, backend)
+    }
+
+    fn holed_file(mids: &[String]) -> crate::census::CensusFile {
+        crate::census::CensusFile {
+            name: "h.bin".into(),
+            articles: mids
+                .iter()
+                .enumerate()
+                .map(|(i, m)| crate::census::ArticleSpan {
+                    message_id: m.clone(),
+                    offset: i as u64 * 1024,
+                    len: 1024,
+                })
+                .collect(),
+        }
+    }
+
+    /// Without a patch, a confirmed hole fails the read as it always has.
+    #[tokio::test]
+    async fn hole_without_patch_fails_the_read() {
+        for patches in [
+            None,
+            Some(Arc::new(crate::patches::PatchStore::in_memory(1 << 20))),
+        ] {
+            let (provider, mids, _, _) = holed_provider(patches);
+            let mut stream = MultiSegmentStream::new(provider, mids, 4);
+            let mut out = Vec::new();
+            let err = stream.read_to_end(&mut out).await.unwrap_err();
+            assert!(err.to_string().contains("h1@t.test"), "{err}");
+        }
+    }
+
+    /// A read over a confirmed hole with a patch returns the patched bytes,
+    /// with no fetch for the hole once it is confirmed.
+    #[tokio::test]
+    async fn hole_with_patch_serves_patched_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = uuid::Uuid::from_u128(7);
+        let stamp = crate::patches::PatchStamp {
+            nzb_blob_id: None,
+            server_fingerprint: "fake-0".into(),
+        };
+        let (_, mids, data, _) = holed_provider(None);
+        {
+            let store = crate::patches::PatchStore::open(dir.path(), 1 << 20).unwrap();
+            store
+                .insert(
+                    release,
+                    &stamp,
+                    &holed_file(&mids),
+                    1024,
+                    data[1024..2048].to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        // A new process: the patch comes back from disk.
+        let store = Arc::new(crate::patches::PatchStore::open(dir.path(), 1 << 20).unwrap());
+        let (provider, mids, data, _) = holed_provider(Some(Arc::clone(&store)));
+        for _ in 0..2 {
+            let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids.clone(), 4);
+            let mut out = Vec::new();
+            stream.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, data);
+        }
+        assert_eq!(
+            provider.ledger().state("h1@t.test"),
+            Some(crate::holes::HoleState::Confirmed)
+        );
+
+        // Deleting the release takes the patch away again.
+        store.drop_release(release);
+        let mut stream = MultiSegmentStream::new(provider, mids, 4);
+        assert!(stream.read_to_end(&mut Vec::new()).await.is_err());
+    }
+
+    fn holed_stamp() -> crate::patches::PatchStamp {
+        crate::patches::PatchStamp {
+            nzb_blob_id: Some(uuid::Uuid::from_u128(1)),
+            server_fingerprint: "fake-0".into(),
+        }
+    }
+
+    /// A read through `DavMultipartFileStream` over a patched hole: the
+    /// file parts map virtual ranges onto segment data, and the hole's bytes
+    /// come from the patch, for a straight read and after a seek into it.
+    #[tokio::test]
+    async fn multipart_read_over_patched_hole() {
+        use nzbdav_core::models::{FilePart, LongRange};
+        use tokio::io::AsyncSeekExt;
+
+        let store = Arc::new(crate::patches::PatchStore::in_memory(1 << 20));
+        let (provider, mids, data, _) = holed_provider(Some(Arc::clone(&store)));
+        store
+            .insert(
+                uuid::Uuid::from_u128(7),
+                &holed_stamp(),
+                &holed_file(&mids),
+                1024,
+                data[1024..2048].to_vec(),
+            )
+            .await
+            .unwrap();
+        // The virtual file starts 512 bytes into segment 0; segment 1 is the
+        // hole.
+        let parts = vec![
+            FilePart {
+                segment_ids: mids[..2].to_vec(),
+                segment_id_byte_range: LongRange::new(512, 2048),
+                file_part_byte_range: LongRange::new(0, 1536),
+            },
+            FilePart {
+                segment_ids: mids[2..].to_vec(),
+                segment_id_byte_range: LongRange::new(0, 2048),
+                file_part_byte_range: LongRange::new(1536, 3584),
+            },
+        ];
+        let mut stream = crate::multipart_file_stream::DavMultipartFileStream::new(
+            Arc::clone(&provider),
+            parts.clone(),
+            3584,
+            4,
+        );
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data[512..]);
+
+        let mut stream =
+            crate::multipart_file_stream::DavMultipartFileStream::new(provider, parts, 3584, 4);
+        stream.seek(std::io::SeekFrom::Start(600)).await.unwrap();
+        let mut buf = vec![0u8; 100];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, data[1112..1212]);
+    }
+
+    /// The hole and its patch outlive the process: after a restart the
+    /// ledger knows the hole before any read, and the read is served from
+    /// the patch without asking the servers for the hole again.
+    #[tokio::test]
+    async fn recorded_hole_and_patch_need_no_server_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = uuid::Uuid::from_u128(7);
+        {
+            let store = Arc::new(crate::patches::PatchStore::open(dir.path(), 1 << 20).unwrap());
+            let (provider, mids, data, _) = holed_provider(Some(Arc::clone(&store)));
+            let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids.clone(), 4);
+            assert!(stream.read_to_end(&mut Vec::new()).await.is_err());
+            store
+                .insert(
+                    release,
+                    &holed_stamp(),
+                    &holed_file(&mids),
+                    1024,
+                    data[1024..2048].to_vec(),
+                )
+                .await
+                .unwrap();
+            let recorded = store
+                .record_holes(release, &holed_stamp(), &provider.ledger().holes())
+                .unwrap();
+            assert_eq!(recorded, 1);
+        }
+
+        let store = Arc::new(crate::patches::PatchStore::open(dir.path(), 1 << 20).unwrap());
+        let (provider, mids, data, backend) = holed_provider(Some(store));
+        assert_eq!(
+            provider.ledger().state("h1@t.test"),
+            Some(crate::holes::HoleState::Confirmed),
+            "restored before any read"
+        );
+        let mut stream = MultiSegmentStream::new(provider, mids, 4);
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data);
+        assert_eq!(backend.fetch_count(), 3, "the hole is not fetched");
     }
 
     /// The prefetch loop should fetch segments concurrently up to the
