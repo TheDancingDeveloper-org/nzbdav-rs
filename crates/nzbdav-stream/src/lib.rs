@@ -5,6 +5,7 @@
 //! locally — every read fetches from Usenet on demand.
 
 pub mod aes_decoder_stream;
+pub mod census;
 pub mod error;
 pub mod multi_segment_stream;
 pub mod multipart_file_stream;
@@ -15,12 +16,16 @@ pub mod seekable_segment_stream;
 pub mod testing;
 
 pub use aes_decoder_stream::AesDecoderStream;
+pub use census::{
+    CensusBackend, CensusConfig, CensusError, CensusReport, CensusTarget, CensusTrigger,
+    DamageCensus, HoleLedger, HoleState, InMemoryHoleLedger, Verdict,
+};
 pub use error::{Result, StreamError};
 pub use multi_segment_stream::MultiSegmentStream;
 pub use multipart_file_stream::DavMultipartFileStream;
 pub use nzb_file_stream::NzbFileStream;
 pub use prioritized_semaphore::{PrioritizedPermit, PrioritizedSemaphore};
-pub use provider::{UsenetArticleProvider, YencHeaders};
+pub use provider::{PoolStat, UsenetArticleProvider, YencHeaders};
 pub use seekable_segment_stream::SeekableSegmentStream;
 
 // Re-export nzb_nntp so consumers can use the same ConnectionPool/ServerConfig types

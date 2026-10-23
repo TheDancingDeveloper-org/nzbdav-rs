@@ -236,6 +236,84 @@ impl UsenetArticleProvider {
         Err(last_err.unwrap_or_else(|| StreamError::AllServersExhausted(message_id.to_string())))
     }
 
+    /// Number of server pools, in priority order. A fake-backed provider
+    /// reports a single pool.
+    pub fn pool_count(&self) -> usize {
+        if self.fake.is_some() {
+            return 1;
+        }
+        self.load_pools().len()
+    }
+
+    /// Connection limit of one pool, or 0 if the index is out of range.
+    pub fn pool_connections(&self, pool: usize) -> usize {
+        if let Some(fake) = &self.fake {
+            return if pool == 0 {
+                fake.total_connections()
+            } else {
+                0
+            };
+        }
+        self.load_pools()
+            .get(pool)
+            .map_or(0, |p| p.config().connections as usize)
+    }
+
+    /// Display name of one pool.
+    pub fn pool_name(&self, pool: usize) -> String {
+        if self.fake.is_some() {
+            return format!("fake-{pool}");
+        }
+        self.load_pools()
+            .get(pool)
+            .map_or_else(|| format!("pool-{pool}"), |p| p.config().name.clone())
+    }
+
+    /// STAT one article on one pool only, with no failover. Unlike [`stat`],
+    /// a 430 and a transport failure stay distinct, so the damage census can
+    /// tell a missing article from one no server answered for. Takes no
+    /// priority permit; the caller holds one.
+    ///
+    /// [`stat`]: Self::stat
+    pub async fn stat_on_pool(&self, pool: usize, message_id: &str) -> PoolStat {
+        if let Some(fake) = &self.fake {
+            if pool != 0 {
+                return PoolStat::Failed(format!("no pool {pool}"));
+            }
+            return match fake.stat(message_id).await {
+                Ok(true) => PoolStat::Present,
+                Ok(false) | Err(StreamError::ArticleNotFound(_)) => PoolStat::Absent,
+                Err(e) => PoolStat::Failed(e.to_string()),
+            };
+        }
+
+        let Some(pool_ref) = self.load_pools().get(pool).cloned() else {
+            return PoolStat::Failed(format!("pool {pool} is no longer configured"));
+        };
+        let mut pooled = match pool_ref.acquire().await {
+            Ok(p) => p,
+            Err(e) => return PoolStat::Failed(format!("acquire: {e}")),
+        };
+        match pooled.conn.stat_article(message_id).await {
+            Ok(resp) => {
+                pool_ref.release(pooled);
+                if resp.code == 223 {
+                    PoolStat::Present
+                } else {
+                    PoolStat::Failed(format!("unexpected STAT response {}", resp.code))
+                }
+            }
+            Err(NntpError::ArticleNotFound(_)) => {
+                pool_ref.release(pooled);
+                PoolStat::Absent
+            }
+            Err(e) => {
+                pool_ref.discard(pooled);
+                PoolStat::Failed(e.to_string())
+            }
+        }
+    }
+
     /// Fetch an article and return its yEnc part headers (begin, end, total).
     /// Useful for seek interpolation to determine which segment contains a
     /// given byte offset.
@@ -294,6 +372,18 @@ impl UsenetArticleProvider {
 
         Err(last_err.unwrap_or_else(|| StreamError::AllServersExhausted(message_id.to_string())))
     }
+}
+
+/// One pool's answer to a STAT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolStat {
+    /// 223: the pool has the article.
+    Present,
+    /// 430: the pool says it has no such article.
+    Absent,
+    /// The pool did not answer: connect, auth, protocol error or timeout.
+    /// Never evidence that the article is missing.
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy)]
