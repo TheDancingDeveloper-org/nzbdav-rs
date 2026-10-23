@@ -86,6 +86,18 @@ impl ConfigManager {
             .unwrap_or(512)
     }
 
+    /// Whether the background PAR2 repair job runs (`enable_repair`). Off
+    /// until switched on: it downloads recovery volumes and every slice of
+    /// a damaged release.
+    pub fn get_enable_repair(&self) -> bool {
+        self.get("repair.enable-repair").is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+    }
+
     pub fn get_categories(&self) -> Vec<String> {
         self.get_or_default("api.categories", "")
             .split(',')

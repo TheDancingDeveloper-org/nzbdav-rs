@@ -10,6 +10,9 @@
 //! the set protects that the release carries, plus its recovery volumes, so
 //! the verdict says whether the set can repair the damage. An item no set
 //! protects is surveyed on its own articles, counted in articles.
+//!
+//! A census that finds lost slices the set may still cover schedules a
+//! repair of the set ([`CensusService::with_repair`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -25,10 +28,11 @@ use uuid::Uuid;
 
 use crate::census::{
     ArticleSpan, CensusError, CensusFile, CensusReport, CensusTarget, CensusTrigger, DamageCensus,
-    Par2RecoverySet,
+    Par2RecoverySet, Verdict,
 };
 use crate::error::StreamError;
 use crate::recovery_set::census_files;
+use crate::repair::{RepairService, RepairTarget, Scheduled};
 
 /// A second hole read of the same item within this window does not start
 /// another census; the census's own cooldown takes over after that.
@@ -40,6 +44,8 @@ pub struct CensusService {
     db: Arc<dyn DavDatabase>,
     /// When each item last started a census from a hole read.
     hole_reads: Mutex<HashMap<Uuid, Instant>>,
+    /// Repairs damage a census finds.
+    repair: Option<Arc<RepairService>>,
 }
 
 impl CensusService {
@@ -48,7 +54,20 @@ impl CensusService {
             census,
             db,
             hole_reads: Mutex::new(HashMap::new()),
+            repair: None,
         }
+    }
+
+    /// Schedule a repair whenever a census finds lost slices that the set
+    /// may still cover.
+    pub fn with_repair(mut self, repair: Arc<RepairService>) -> Self {
+        self.repair = Some(repair);
+        self
+    }
+
+    /// The repair service, if one is attached.
+    pub fn repair(&self) -> Option<&Arc<RepairService>> {
+        self.repair.as_ref()
     }
 
     /// The census this service runs.
@@ -59,6 +78,19 @@ impl CensusService {
     /// The releases a DAV item belongs to, as census targets: one per PAR2
     /// set protecting it, or the item alone when none does.
     pub async fn targets_for_item(&self, item: &DavItem) -> Result<Vec<CensusTarget>> {
+        Ok(self
+            .releases_for_item(item)
+            .await?
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect())
+    }
+
+    /// Census targets of an item, each with the repair target of its set.
+    async fn releases_for_item(
+        &self,
+        item: &DavItem,
+    ) -> Result<Vec<(CensusTarget, Option<RepairTarget>)>> {
         let refs = self.db.get_par2_files_for_dav_item(item.id).await?;
         let mut wanted: BTreeMap<Uuid, Vec<[u8; 16]>> = BTreeMap::new();
         for r in refs {
@@ -78,15 +110,23 @@ impl CensusService {
                 if files.is_empty() {
                     continue;
                 }
-                targets.push(CensusTarget {
-                    key: set_key(history_item_id, &record.recovery_set_id),
+                let key = set_key(history_item_id, &record.recovery_set_id);
+                let census = CensusTarget {
+                    key: key.clone(),
                     files,
                     recovery: Some(Par2RecoverySet::from(&record)),
-                });
+                };
+                let repair = RepairTarget {
+                    key,
+                    release: history_item_id,
+                    nzb_blob_id: item.nzb_blob_id,
+                    record,
+                };
+                targets.push((census, Some(repair)));
             }
         }
         if targets.is_empty() {
-            targets.push(self.item_target(item).await?);
+            targets.push((self.item_target(item).await?, None));
         }
         Ok(targets)
     }
@@ -116,12 +156,34 @@ impl CensusService {
         item: &DavItem,
         trigger: CensusTrigger,
     ) -> Result<Vec<std::result::Result<CensusReport, CensusError>>> {
-        let targets = self.targets_for_item(item).await?;
+        let targets = self.releases_for_item(item).await?;
         let mut results = Vec::with_capacity(targets.len());
-        for target in &targets {
-            results.push(self.census.run(target, trigger).await);
+        for (target, repair) in targets {
+            let result = self.census.run(&target, trigger).await;
+            if let (Ok(report), Some(repair)) = (&result, repair) {
+                self.maybe_repair(report, repair);
+            }
+            results.push(result);
         }
         Ok(results)
+    }
+
+    /// Schedule a repair when the census found lost slices and did not
+    /// settle the set as beyond repair.
+    fn maybe_repair(&self, report: &CensusReport, target: RepairTarget) {
+        let Some(repair) = &self.repair else { return };
+        if !wants_repair(report) {
+            return;
+        }
+        match repair.schedule(target) {
+            Scheduled::Queued(_) => {
+                info!(key = %report.key, damaged = report.damaged, "repair scheduled")
+            }
+            Scheduled::Folded(_) => {
+                debug!(key = %report.key, "damage folded into the running repair")
+            }
+            Scheduled::Skipped(reason) => debug!(key = %report.key, ?reason, "repair skipped"),
+        }
     }
 
     /// Survey the item by id, for the operator.
@@ -190,6 +252,12 @@ pub fn is_missing_article(err: &std::io::Error) -> bool {
         source = e.source();
     }
     false
+}
+
+/// Whether a census report calls for a repair: slices are known lost and
+/// the census did not find them beyond what the set carries.
+fn wants_repair(report: &CensusReport) -> bool {
+    report.damaged > 0 && report.verdict != Some(Verdict::BeyondRepair)
 }
 
 fn set_key(history_item_id: Uuid, recovery_set_id: &[u8; 16]) -> String {
