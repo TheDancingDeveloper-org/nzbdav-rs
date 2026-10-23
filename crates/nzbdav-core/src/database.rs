@@ -2,7 +2,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::models::{DavItem, HistoryItem, QueueItem};
+use crate::models::{DavItem, HistoryItem, Par2FileRef, Par2SetRecord, QueueItem};
 
 /// Database abstraction for nzbdav storage.
 ///
@@ -66,6 +66,37 @@ pub trait DavDatabase: Send + Sync {
 
     /// Delete a raw NZB XML blob.
     async fn delete_nzb_blob(&self, id: Uuid) -> Result<()>;
+
+    // ── PAR2 recovery sets ─────────────────────────────────────────────
+    //
+    // Defaults keep backends that do not record PAR2 sets working: nothing
+    // is stored and every lookup comes back empty.
+
+    /// Replace the PAR2 recovery sets recorded for a history item. They go
+    /// with `job_dir_id` and with the history item.
+    async fn put_par2_sets(
+        &self,
+        _history_item_id: Uuid,
+        _job_dir_id: Uuid,
+        _sets: &[Par2SetRecord],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// PAR2 recovery sets recorded for a history item.
+    async fn get_par2_sets(&self, _history_item_id: Uuid) -> Result<Vec<Par2SetRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Protected files a DAV item reads from (reverse of the file mapping).
+    async fn get_par2_files_for_dav_item(&self, _dav_item_id: Uuid) -> Result<Vec<Par2FileRef>> {
+        Ok(Vec::new())
+    }
+
+    /// Drop the PAR2 recovery sets recorded for a history item.
+    async fn delete_par2_sets(&self, _history_item_id: Uuid) -> Result<()> {
+        Ok(())
+    }
 
     // ── Queue operations ───────────────────────────────────────────────
 

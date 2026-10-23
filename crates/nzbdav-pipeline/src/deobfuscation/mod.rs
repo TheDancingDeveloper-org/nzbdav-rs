@@ -36,6 +36,8 @@ pub struct NzbFileInfo {
     pub first_16k: Option<Vec<u8>>,
     /// MD5 of first 16KB.
     pub hash_16k: Option<[u8; 16]>,
+    /// Decoded size of the first segment, when it was fetched.
+    pub first_segment_size: Option<u64>,
     /// Error from first-segment analysis, if the file fell back to subject metadata.
     pub first_segment_error: Option<String>,
     /// Missing article ID observed during first-segment analysis.

@@ -151,6 +151,7 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
 }
 
 pub fn delete_by_history_item_id(conn: &Connection, history_item_id: Uuid) -> Result<()> {
+    crate::par2_sets::delete_by_history_item_id(conn, history_item_id)?;
     conn.execute(
         "DELETE FROM dav_items WHERE history_item_id = ?1",
         params![history_item_id.to_string()],

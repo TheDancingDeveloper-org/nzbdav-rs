@@ -16,6 +16,8 @@ pub mod db;
 #[cfg(feature = "sqlite")]
 pub mod history_items;
 #[cfg(feature = "sqlite")]
+pub mod par2_sets;
+#[cfg(feature = "sqlite")]
 pub mod queue_items;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_db;
