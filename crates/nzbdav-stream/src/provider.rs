@@ -202,7 +202,7 @@ impl UsenetArticleProvider {
     /// Read-ahead article fetch: prefetch beyond the segment a client is
     /// waiting on. Shares the low tier with ingest.
     pub async fn fetch_decoded_readahead(&self, message_id: &str) -> Result<Vec<u8>> {
-        self.fetch_decoded_with_priority(message_id, FetchPriority::Low)
+        self.fetch_decoded_with_priority(message_id, FetchPriority::ReadAhead)
             .await
     }
 
@@ -225,13 +225,13 @@ impl UsenetArticleProvider {
         let first = async {
             tokio::select! {
                 biased;
-                () = promote => sem.acquire_high().await,
-                permit = sem.acquire_readahead() => permit,
+                () = promote => (sem.acquire_high().await, FetchPriority::High),
+                permit = sem.acquire_readahead() => (permit, FetchPriority::ReadAhead),
             }
         };
-        // A confirming re-ask runs at demand: the reader is about to need it.
-        self.fetch_ledgered(message_id, FetchPriority::High, first)
-            .await
+        // A confirming re-ask, and any later round, runs at the tier the
+        // first permit ran at: demand only if the reader reached it first.
+        self.fetch_ledgered(message_id, first).await
     }
 
     async fn fetch_decoded_with_priority(
@@ -239,21 +239,23 @@ impl UsenetArticleProvider {
         message_id: &str,
         priority: FetchPriority,
     ) -> Result<Vec<u8>> {
-        self.fetch_ledgered(message_id, priority, self.permit(priority))
-            .await
+        let first = async move { (self.permit(priority).await, priority) };
+        self.fetch_ledgered(message_id, first).await
     }
 
     /// Consult the ledger, fetch, and confirm a provisional refusal. The
-    /// first attempt holds the permit `first` yields; later rounds take one
-    /// at `priority`.
+    /// first attempt holds the permit `first` yields; the confirm and later
+    /// rounds take one at the tier `first` reports it ran at. Until `first`
+    /// has run (a joined confirm can answer before it), that tier is
+    /// read-ahead at most, never demand by default.
     async fn fetch_ledgered(
         &self,
         message_id: &str,
-        priority: FetchPriority,
-        first: impl std::future::Future<Output = PrioritizedPermit>,
+        first: impl std::future::Future<Output = (PrioritizedPermit, FetchPriority)>,
     ) -> Result<Vec<u8>> {
         let servers = self.servers();
         let mut first = Some(first);
+        let mut priority = FetchPriority::ReadAhead;
         loop {
             match self.ledger.consult(message_id, &servers) {
                 Consult::Skip => {
@@ -270,7 +272,11 @@ impl UsenetArticleProvider {
 
             let (attempt, noted) = {
                 let _permit = match first.take() {
-                    Some(first) => first.await,
+                    Some(first) => {
+                        let (permit, ran_at) = first.await;
+                        priority = ran_at;
+                        permit
+                    }
                     None => self.permit(priority).await,
                 };
                 self.fetch_once(message_id, &servers).await
@@ -292,6 +298,7 @@ impl UsenetArticleProvider {
         let sem = self.priority_semaphore();
         match priority {
             FetchPriority::High => sem.acquire_high().await,
+            FetchPriority::ReadAhead => sem.acquire_readahead().await,
             FetchPriority::Low => sem.acquire_low().await,
             FetchPriority::Repair => sem.acquire_repair().await,
         }
@@ -737,6 +744,7 @@ impl Drop for ConfirmGuard<'_> {
 #[derive(Debug, Clone, Copy)]
 enum FetchPriority {
     High,
+    ReadAhead,
     Low,
     Repair,
 }
@@ -745,6 +753,7 @@ enum FetchPriority {
 mod tests {
     use super::*;
     use crate::holes::{HOLE_TTL, HoleState};
+    use crate::prioritized_semaphore::PermitTier;
 
     #[tokio::test]
     async fn test_empty_provider_fetch_decoded() {
@@ -784,6 +793,7 @@ mod tests {
     /// each answer. Counts calls per pool.
     struct Scripted {
         pools: usize,
+        connections: usize,
         start: tokio::time::Instant,
         latency: Duration,
         script: Box<Script>,
@@ -797,6 +807,7 @@ mod tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 pools,
+                connections: pools,
                 start: tokio::time::Instant::now(),
                 latency: Duration::ZERO,
                 script: Box::new(script),
@@ -811,6 +822,24 @@ mod tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 pools,
+                connections: pools,
+                start: tokio::time::Instant::now(),
+                latency,
+                script: Box::new(script),
+                calls: Mutex::new(vec![0; pools]),
+            })
+        }
+
+        /// A fake with `connections` permits in all, for tier tests.
+        fn sized(
+            pools: usize,
+            connections: usize,
+            latency: Duration,
+            script: impl Fn(usize, Duration) -> Reply + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                pools,
+                connections,
                 start: tokio::time::Instant::now(),
                 latency,
                 script: Box::new(script),
@@ -839,7 +868,7 @@ mod tests {
             Err(StreamError::Other(format!("no headers for {message_id}")))
         }
         fn total_connections(&self) -> usize {
-            self.pools
+            self.connections
         }
         fn pool_count(&self) -> usize {
             self.pools
@@ -1026,6 +1055,131 @@ mod tests {
             started.elapsed() <= HOLE_CONFIRM_DELAY + HOLE_CONFIRM_FETCH + Duration::from_millis(1)
         );
         assert_eq!(provider.ledger().state("a@x"), Some(HoleState::Provisional));
+    }
+
+    /// Read-ahead that never reaches the head: its confirming re-ask runs at
+    /// read-ahead, not demand.
+    #[tokio::test(start_paused = true)]
+    async fn readahead_refusal_confirms_at_readahead() {
+        let backend = Scripted::sized(1, 20, Duration::from_millis(100), |_, _| Reply::Refused);
+        let provider = provider(&backend);
+        let sem = provider.priority_semaphore();
+        let fetch = tokio::spawn({
+            let provider = Arc::clone(&provider);
+            async move {
+                provider
+                    .fetch_decoded_promotable("a@x", std::future::pending())
+                    .await
+            }
+        });
+
+        // First ask 0..100 ms, confirm delay 1 s, re-ask 1.1..1.2 s.
+        tokio::time::sleep(Duration::from_millis(1150)).await;
+        assert_eq!(backend.calls(), 2, "the re-ask is in flight");
+        assert_eq!(sem.held(PermitTier::ReadAhead), 1);
+        assert_eq!(sem.held(PermitTier::Demand), 0);
+
+        let err = fetch.await.unwrap().unwrap_err();
+        assert!(matches!(err, StreamError::ArticleNotFound(_)), "{err}");
+        assert_eq!(provider.ledger().state("a@x"), Some(HoleState::Confirmed));
+        assert_eq!(sem.held_total(), 0);
+    }
+
+    /// A segment promoted to head re-asks at demand, and a demand reader of
+    /// the same article joins that one confirm instead of asking again.
+    #[tokio::test(start_paused = true)]
+    async fn promoted_fetch_and_demand_reader_share_one_confirm() {
+        let backend = Scripted::sized(1, 20, Duration::from_millis(100), |_, t| {
+            if t < Duration::from_millis(350) {
+                Reply::Refused
+            } else {
+                Reply::Body
+            }
+        });
+        let provider = provider(&backend);
+        let sem = provider.priority_semaphore();
+        let promoted = tokio::spawn({
+            let provider = Arc::clone(&provider);
+            async move {
+                provider
+                    .fetch_decoded_promotable("a@x", std::future::ready(()))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(provider.held_provisionally("a@x"));
+        let reader = tokio::spawn({
+            let provider = Arc::clone(&provider);
+            async move { provider.fetch_decoded("a@x").await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(sem.held(PermitTier::Demand), 1, "re-ask at demand");
+        assert_eq!(sem.held(PermitTier::ReadAhead), 0);
+
+        assert_eq!(promoted.await.unwrap().unwrap(), b"payload");
+        assert_eq!(reader.await.unwrap().unwrap(), b"payload");
+        assert_eq!(backend.calls(), 2, "one ask, one shared confirm");
+        assert_eq!(sem.held_total(), 0);
+    }
+
+    /// A damaged region spanning the whole lookahead: every provisional
+    /// refusal re-asks at read-ahead, so none of it is held at demand, a
+    /// demand request still gets through at once, and every permit comes
+    /// back once the holes are confirmed.
+    #[tokio::test(start_paused = true)]
+    async fn damaged_lookahead_keeps_demand_reserve_and_returns_permits() {
+        const LOOKAHEAD: usize = 30;
+        let backend = Scripted::sized(1, 20, Duration::from_millis(100), |_, _| Reply::Refused);
+        let provider = provider(&backend);
+        let sem = provider.priority_semaphore();
+        let fetches: Vec<_> = (0..LOOKAHEAD)
+            .map(|i| {
+                let provider = Arc::clone(&provider);
+                tokio::spawn(async move {
+                    provider
+                        .fetch_decoded_promotable(&format!("{i}@x"), std::future::pending())
+                        .await
+                })
+            })
+            .collect();
+
+        // Watch the confirm rounds: nothing of the window runs at demand.
+        let mut ticks = 0;
+        while ticks < 40 && fetches.iter().any(|f| !f.is_finished()) {
+            assert_eq!(sem.held(PermitTier::Demand), 0, "tick {ticks}");
+            assert!(sem.held_total() <= 20);
+            if ticks == 12 {
+                // Mid-confirm (~1.2 s): a demand request is served by the
+                // next freed permit, ahead of every queued read-ahead.
+                let demand = tokio::time::timeout(Duration::from_millis(150), sem.acquire_high())
+                    .await
+                    .expect("demand is not starved by the damaged window");
+                drop(demand);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ticks += 1;
+        }
+
+        for fetch in fetches {
+            let err = fetch.await.unwrap().unwrap_err();
+            assert!(matches!(err, StreamError::ArticleNotFound(_)), "{err}");
+        }
+        for i in 0..LOOKAHEAD {
+            assert_eq!(
+                provider.ledger().state(&format!("{i}@x")),
+                Some(HoleState::Confirmed)
+            );
+        }
+        assert_eq!(backend.calls(), 2 * LOOKAHEAD);
+        assert_eq!(sem.held_total(), 0);
+        for tier in [
+            PermitTier::Demand,
+            PermitTier::ReadAhead,
+            PermitTier::Repair,
+        ] {
+            assert_eq!(sem.waiting(tier), 0);
+        }
     }
 
     /// `stat_on_pool` keeps a 430 and a transport failure apart.
