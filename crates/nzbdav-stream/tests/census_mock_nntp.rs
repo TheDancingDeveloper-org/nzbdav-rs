@@ -155,19 +155,27 @@ async fn every_pool_saying_430_is_a_miss() {
     assert_eq!(report.verdict, Some(Verdict::BeyondRepair));
 }
 
-/// A server that does not know STAT answers `500`: that is the server
-/// failing to answer, never a 430, so the article stays unestablished.
+/// A server that does not offer STAT is the server failing to answer,
+/// never a 430, so its articles stay unestablished. nzb-nntp assumes STAT on
+/// every real connect (and answers it as `ArticleNotFound` when it is
+/// absent), so B's idle connections are given capabilities without STAT.
 #[tokio::test]
 async fn server_without_stat_is_a_failure_not_a_miss() {
     let a = MockNntpServer::start(mock(&[])).await;
-    let mut b_config = mock(&[]);
-    b_config.article_response_overrides =
-        HashMap::from([("x".to_string(), 500), ("y".to_string(), 500)]);
-    let b = MockNntpServer::start(b_config).await;
-    let census = census(
-        vec![pool("A", a.port()), pool("B", b.port())],
-        Duration::from_secs(5),
-    );
+    let b = MockNntpServer::start(mock(&[])).await;
+    let b_pool = pool("B", b.port());
+    let mut held = Vec::new();
+    for _ in 0..b_pool.config().connections {
+        let mut conn = b_pool.acquire().await.unwrap();
+        let mut caps = conn.conn.capabilities().clone();
+        caps.have_stat = false;
+        conn.conn.set_capabilities_for_test(caps);
+        held.push(conn);
+    }
+    for conn in held {
+        b_pool.release(conn);
+    }
+    let census = census(vec![pool("A", a.port()), b_pool], Duration::from_secs(5));
     let report = census
         .run(&target(&["x", "y"]), CensusTrigger::Operator)
         .await
@@ -176,11 +184,13 @@ async fn server_without_stat_is_a_failure_not_a_miss() {
     assert_eq!(report.unestablished_ids, vec!["x", "y"]);
     assert_eq!(report.pool_failures.len(), 1);
     assert_eq!(report.pool_failures[0].name, "B");
+    assert!(report.pool_failures[0].last_error.contains("STAT"));
     assert_eq!(report.verdict, None);
 }
 
-/// A STAT that times out gives its connection back: on a one-connection
-/// pool, the next acquire succeeds rather than waiting forever.
+/// A STAT that times out gives its connection back: once the census is
+/// done, every connection of the pool can be acquired again rather than
+/// waiting forever.
 #[tokio::test]
 async fn timed_out_stat_returns_its_connection() {
     let mut config = mock(&[]);
@@ -188,7 +198,7 @@ async fn timed_out_stat_returns_its_connection() {
     let server = MockNntpServer::start(config).await;
     let mut server_config = test_config(server.port());
     server_config.name = "slow".into();
-    server_config.connections = 1;
+    server_config.connections = 2;
     let slow = Arc::new(ConnectionPool::new(Arc::new(server_config)));
 
     let census = census(vec![slow.clone()], Duration::from_millis(200));
@@ -199,9 +209,16 @@ async fn timed_out_stat_returns_its_connection() {
     assert_eq!(report.unestablished_ids, vec!["x", "y"]);
     assert!(report.pool_failures[0].last_error.contains("timed out"));
 
-    let conn = tokio::time::timeout(Duration::from_secs(5), slow.acquire())
-        .await
-        .expect("the timed-out STAT's connection came back")
-        .expect("a fresh connection opens");
-    slow.discard(conn);
+    let mut conns = Vec::new();
+    for _ in 0..2 {
+        conns.push(
+            tokio::time::timeout(Duration::from_secs(5), slow.acquire())
+                .await
+                .expect("the timed-out STAT's connection came back")
+                .expect("a fresh connection opens"),
+        );
+    }
+    for conn in conns {
+        slow.discard(conn);
+    }
 }
