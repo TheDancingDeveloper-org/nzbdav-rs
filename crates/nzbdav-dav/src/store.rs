@@ -4,13 +4,18 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
+use futures::StreamExt;
+use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 use tracing::debug;
 use uuid::Uuid;
 
 use nzbdav_core::database::DavDatabase;
 use nzbdav_core::models::{DavItem, DavMultipartFile, DavNzbFile, ItemSubType, ItemType};
-use nzbdav_stream::{AesDecoderStream, DavMultipartFileStream, UsenetArticleProvider};
+use nzbdav_stream::{
+    AesDecoderStream, CensusService, DavMultipartFileStream, UsenetArticleProvider,
+    is_missing_article,
+};
 
 use crate::error::{DavServerError, Result};
 
@@ -53,6 +58,8 @@ pub struct DatabaseStore {
     db: Arc<dyn DavDatabase>,
     provider: Arc<UsenetArticleProvider>,
     lookahead: usize,
+    /// Surveys a release when a read meets a missing article.
+    census: Option<Arc<CensusService>>,
 }
 
 impl DatabaseStore {
@@ -65,7 +72,39 @@ impl DatabaseStore {
             db,
             provider,
             lookahead,
+            census: None,
         }
+    }
+
+    /// Start a damage census of the release whenever a read of one of its
+    /// files meets a missing article.
+    pub fn with_census(mut self, census: Arc<CensusService>) -> Self {
+        self.census = Some(census);
+        self
+    }
+
+    /// Response body reading `reader` for `item`. The first missing article
+    /// the read meets starts a census of the item's release.
+    pub fn body_for<R>(&self, item: &DavItem, reader: R) -> Body
+    where
+        R: AsyncRead + Send + 'static,
+    {
+        let stream = ReaderStream::new(reader);
+        let Some(census) = self.census.clone() else {
+            return Body::from_stream(stream);
+        };
+        let item = item.clone();
+        let mut reported = false;
+        Body::from_stream(stream.map(move |chunk| {
+            if let Err(e) = &chunk
+                && !reported
+                && is_missing_article(e)
+            {
+                reported = true;
+                census.hole_read(&item);
+            }
+            chunk
+        }))
     }
 
     /// Access the database.
@@ -165,9 +204,9 @@ impl DatabaseStore {
                 if let Some(aes) = meta.aes_params {
                     let decoded_size = aes.decoded_size as u64;
                     let aes_stream = AesDecoderStream::new(stream, &aes.key, &aes.iv, decoded_size);
-                    Ok(Body::from_stream(ReaderStream::new(aes_stream)))
+                    Ok(self.body_for(item, aes_stream))
                 } else {
-                    Ok(Body::from_stream(ReaderStream::new(stream)))
+                    Ok(self.body_for(item, stream))
                 }
             }
             ItemSubType::NzbFile => {
@@ -182,7 +221,7 @@ impl DatabaseStore {
                     self.lookahead,
                 );
 
-                Ok(Body::from_stream(ReaderStream::new(stream)))
+                Ok(self.body_for(item, stream))
             }
             other => Err(DavServerError::Other(format!(
                 "unsupported sub_type for streaming: {other:?}"

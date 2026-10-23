@@ -8,7 +8,6 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use percent_encoding::percent_decode_str;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
 use nzbdav_core::models::{DavMultipartFile, ItemSubType};
@@ -288,7 +287,7 @@ async fn serve_streaming(
                     .await
                     .is_ok()
                 {
-                    let body = Body::from_stream(ReaderStream::new(stream.take(content_length)));
+                    let body = store.body_for(&node.item, stream.take(content_length));
 
                     return Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
@@ -326,9 +325,7 @@ async fn serve_streaming(
                             .header(header::CONTENT_LENGTH, content_length)
                             .header(header::ETAG, &node.etag)
                             .header(header::ACCEPT_RANGES, "bytes")
-                            .body(Body::from_stream(ReaderStream::new(
-                                stream.take(content_length),
-                            )))
+                            .body(store.body_for(&node.item, stream.take(content_length)))
                             .unwrap();
                     }
                     Err(e) => {

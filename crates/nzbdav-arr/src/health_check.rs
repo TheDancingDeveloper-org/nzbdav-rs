@@ -14,7 +14,7 @@ use nzbdav_core::models::{
     DavItem, DavMultipartFile, DavNzbFile, HealthCheckResult, HealthResult, ItemSubType, ItemType,
     RepairStatus,
 };
-use nzbdav_stream::UsenetArticleProvider;
+use nzbdav_stream::{CensusService, CensusTrigger, UsenetArticleProvider, Verdict};
 
 use crate::error::Result;
 
@@ -25,6 +25,8 @@ pub enum HealthCheckOutcome {
     Unhealthy {
         missing_articles: usize,
         total_articles: usize,
+        /// What the damage census made of it, when one ran.
+        census: Option<String>,
     },
     Error(String),
 }
@@ -38,6 +40,8 @@ pub struct HealthCheckService {
     check_interval: Duration,
     /// Maximum articles to STAT per check cycle.
     max_articles_per_cycle: usize,
+    /// When set, items are checked by a damage census of their release.
+    census: Option<Arc<CensusService>>,
 }
 
 impl HealthCheckService {
@@ -52,7 +56,20 @@ impl HealthCheckService {
             cancel,
             check_interval: Duration::from_secs(3600),
             max_articles_per_cycle: 500,
+            census: None,
         }
+    }
+
+    /// Check items with a damage census of their release instead of a
+    /// plain STAT of their first articles.
+    pub fn with_census(mut self, census: Arc<CensusService>) -> Self {
+        self.census = Some(census);
+        self
+    }
+
+    /// Whether items are checked by a damage census.
+    pub fn has_census(&self) -> bool {
+        self.census.is_some()
     }
 
     /// Run the health check loop until cancelled.
@@ -112,17 +129,22 @@ impl HealthCheckService {
                 HealthCheckOutcome::Unhealthy {
                     missing_articles,
                     total_articles,
+                    census,
                 } => {
                     warn!(
                         path = %item.path,
                         missing = missing_articles,
                         total = total_articles,
+                        census = census.as_deref().unwrap_or("-"),
                         "item unhealthy",
                     );
-                    (
-                        HealthResult::Unhealthy,
-                        format!("{missing_articles}/{total_articles} articles missing"),
-                    )
+                    let mut message =
+                        format!("{missing_articles}/{total_articles} articles missing");
+                    if let Some(census) = census {
+                        message.push_str("; ");
+                        message.push_str(census);
+                    }
+                    (HealthResult::Unhealthy, message)
                 }
                 HealthCheckOutcome::Error(msg) => {
                     error!(path = %item.path, error = %msg, "health check error");
@@ -159,8 +181,19 @@ impl HealthCheckService {
         Ok(())
     }
 
-    /// Check a single DavItem's articles for availability.
+    /// Check a single DavItem's articles for availability: by a damage
+    /// census when one is attached and it could run, else by STAT.
     pub async fn check_item(&self, item: &DavItem) -> HealthCheckOutcome {
+        if let Some(census) = &self.census
+            && let Some(outcome) = census_outcome(census, item).await
+        {
+            return outcome;
+        }
+        self.stat_item(item).await
+    }
+
+    /// STAT up to `max_articles_per_cycle` of an item's articles.
+    async fn stat_item(&self, item: &DavItem) -> HealthCheckOutcome {
         let segment_ids = match self.get_segment_ids(item) {
             Ok(ids) => ids,
             Err(e) => return HealthCheckOutcome::Error(e.to_string()),
@@ -193,6 +226,7 @@ impl HealthCheckService {
             HealthCheckOutcome::Unhealthy {
                 missing_articles: missing,
                 total_articles: total,
+                census: None,
             }
         }
     }
@@ -367,4 +401,54 @@ impl HealthCheckService {
             _ => 0,
         }
     }
+}
+
+/// Health of an item from a census of every release it belongs to. `None`
+/// when no census could run (every target cooling down or already being
+/// surveyed), so the caller falls back to STAT.
+async fn census_outcome(census: &CensusService, item: &DavItem) -> Option<HealthCheckOutcome> {
+    let results = match census.survey_item(item, CensusTrigger::HealthCheck).await {
+        Ok(results) => results,
+        Err(e) => return Some(HealthCheckOutcome::Error(format!("census: {e}"))),
+    };
+    let reports: Vec<_> = results
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(report) => Some(report),
+            Err(e) => {
+                debug!(path = %item.path, error = %e, "health check census skipped");
+                None
+            }
+        })
+        .collect();
+    if reports.is_empty() {
+        return None;
+    }
+
+    let total: usize = reports.iter().map(|r| r.articles).sum();
+    let missing: usize = reports.iter().map(|r| r.missing_ids.len()).sum();
+    let unestablished: usize = reports.iter().map(|r| r.unestablished_ids.len()).sum();
+    if missing == 0 && unestablished == 0 {
+        return Some(HealthCheckOutcome::Healthy);
+    }
+    if missing == 0 {
+        // Servers failed to answer: that says nothing about the articles.
+        return Some(HealthCheckOutcome::Error(format!(
+            "{unestablished}/{total} articles unestablished: servers failed to answer"
+        )));
+    }
+    let verdicts: Vec<&str> = reports
+        .iter()
+        .map(|r| match r.verdict {
+            Some(Verdict::Intact) => "intact",
+            Some(Verdict::Repairable) => "repairable",
+            Some(Verdict::BeyondRepair) => "beyond repair",
+            None => "unsettled",
+        })
+        .collect();
+    Some(HealthCheckOutcome::Unhealthy {
+        missing_articles: missing,
+        total_articles: total,
+        census: Some(format!("census: {}", verdicts.join(", "))),
+    })
 }
