@@ -234,8 +234,9 @@ impl ArticleBackend for MockArticleBackend {
     }
 
     fn total_connections(&self) -> usize {
-        // Effectively unlimited for tests.
-        usize::MAX / 2
+        // Effectively unlimited for tests, small enough that the priority
+        // semaphore's percentage arithmetic cannot overflow.
+        1 << 20
     }
 }
 

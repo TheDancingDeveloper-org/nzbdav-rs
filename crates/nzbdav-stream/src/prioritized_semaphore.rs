@@ -521,21 +521,42 @@ mod tests {
     }
 
     /// Acceptance: 20 permits, 15 demand waiters and 15 repair waiters.
-    /// Repair holds at least 5 while demand is saturated.
+    /// Repair holds at least 5 while demand is saturated. Both tiers are
+    /// queued at the same time (interleaved, repair first) behind a full
+    /// pool, so they contend for every permit as it frees up.
     #[tokio::test]
     async fn repair_holds_floor_while_demand_saturated() {
         let sem = Arc::new(PrioritizedSemaphore::new(20, 5));
-        let release = Arc::new(Notify::new());
-        let mut tasks = spawn_holders(&sem, PermitTier::Demand, 15, &release);
-        settle("demand saturated", || sem.held(PermitTier::Demand) == 15).await;
-        tasks.extend(spawn_holders(&sem, PermitTier::Repair, 15, &release));
+        let unblock = Arc::new(Notify::new());
+        let blockers = spawn_holders(&sem, PermitTier::Demand, 20, &unblock);
+        settle("pool full", || sem.held_total() == 20).await;
 
-        settle("repair at floor", || sem.held(PermitTier::Repair) >= 5).await;
-        assert_eq!(sem.held_total(), 20);
+        let release = Arc::new(Notify::new());
+        let mut tasks = Vec::new();
+        for _ in 0..15 {
+            tasks.extend(spawn_holders(&sem, PermitTier::Repair, 1, &release));
+            tasks.extend(spawn_holders(&sem, PermitTier::Demand, 1, &release));
+        }
+        settle("both tiers queued", || {
+            sem.waiting(PermitTier::Demand) == 15 && sem.waiting(PermitTier::Repair) == 15
+        })
+        .await;
+
+        for t in blockers {
+            while !t.is_finished() {
+                unblock.notify_waiters();
+                tokio::task::yield_now().await;
+            }
+            t.await.unwrap();
+        }
+
+        settle("turnover", || sem.held_total() == 20).await;
+        assert_eq!(sem.held(PermitTier::Demand), 15);
+        assert!(sem.held(PermitTier::Repair) >= 5);
+        assert_eq!(sem.held(PermitTier::Repair), 5);
         assert_eq!(sem.waiting(PermitTier::Demand), 0);
         assert_eq!(sem.waiting(PermitTier::Repair), 10);
 
-        release.notify_waiters();
         for t in tasks {
             // Late holders missed the first notify; keep waking them.
             while !t.is_finished() {

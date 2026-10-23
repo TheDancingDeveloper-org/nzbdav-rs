@@ -11,7 +11,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesOrdered;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error};
 
 use crate::error::StreamError;
@@ -49,6 +49,11 @@ impl MultiSegmentStream {
         // Parallel, in-order prefetch. Up to `lookahead` fetches can be
         // in flight at once; FuturesOrdered yields results in the original
         // submission order, preserving the stream's byte ordering.
+        //
+        // Only the head of the window — the segment the reader needs next —
+        // is demand. Everything beyond it waits at the read-ahead tier and
+        // is promoted to demand if the head reaches it before it gets a
+        // permit, so read-ahead never outranks repair.
         let concurrency = lookahead.max(1);
         let spawn_result = tokio::spawn(async move {
             debug!(
@@ -58,13 +63,24 @@ impl MultiSegmentStream {
             let mut pending: FuturesOrdered<BoxFuture<'static, Result<Vec<u8>, StreamError>>> =
                 FuturesOrdered::new();
             let mut next_to_spawn = 0usize;
+            let (head_tx, head_rx) = watch::channel(0usize);
             let spawn_one = |idx: usize,
                              provider: &Arc<UsenetArticleProvider>,
                              segment_ids: &Vec<String>|
              -> BoxFuture<'static, Result<Vec<u8>, StreamError>> {
                 let p = Arc::clone(provider);
                 let mid = segment_ids[idx].clone();
-                Box::pin(async move { p.fetch_decoded_high(&mid).await })
+                let mut head = head_rx.clone();
+                Box::pin(async move {
+                    let promote = async move {
+                        // A closed channel means the stream is shutting
+                        // down; stay at read-ahead.
+                        if head.wait_for(|&h| h >= idx).await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    p.fetch_decoded_promotable(&mid, promote).await
+                })
             };
 
             while next_to_spawn < segment_ids.len() && pending.len() < concurrency {
@@ -72,7 +88,10 @@ impl MultiSegmentStream {
                 next_to_spawn += 1;
             }
 
+            let mut head = 0usize;
             while let Some(result) = pending.next().await {
+                head += 1;
+                head_tx.send_replace(head);
                 if tx.send(result).await.is_err() {
                     debug!("receiver dropped, stopping prefetch");
                     return;
@@ -153,6 +172,7 @@ impl AsyncRead for MultiSegmentStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prioritized_semaphore::PermitTier;
     use crate::testing::{MockArticleBackend, build_yenc_articles};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
@@ -230,5 +250,118 @@ mod tests {
             peak >= 2,
             "expected >=2 concurrent fetches with lookahead=4, saw peak={peak}"
         );
+    }
+
+    /// Mock backend whose fetches each wait for a gate permit, on a
+    /// four-connection pool (1 demand reserve, read-ahead capped at 3).
+    struct Gated {
+        inner: MockArticleBackend,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::ArticleBackend for Gated {
+        async fn fetch_decoded(&self, m: &str) -> Result<Vec<u8>, StreamError> {
+            self.gate.acquire().await.unwrap().forget();
+            self.inner.fetch_decoded(m).await
+        }
+        async fn stat(&self, m: &str) -> Result<bool, StreamError> {
+            self.inner.stat(m).await
+        }
+        async fn yenc_headers(&self, m: &str) -> Result<crate::provider::YencHeaders, StreamError> {
+            self.inner.yenc_headers(m).await
+        }
+        fn total_connections(&self) -> usize {
+            4
+        }
+    }
+
+    fn gated_provider(
+        segments: usize,
+    ) -> (Arc<UsenetArticleProvider>, Arc<Gated>, Vec<String>, Vec<u8>) {
+        let data: Vec<u8> = (0..segments * 512).map(|i| (i % 251) as u8).collect();
+        let parts: Vec<(u32, u64, usize)> = (0..segments)
+            .map(|i| (i as u32 + 1, (i * 512) as u64, 512))
+            .collect();
+        let articles = build_yenc_articles("g.bin", &data, &parts);
+        let mids: Vec<String> = (0..segments).map(|i| format!("g{i}@t.test")).collect();
+        let mut inner = MockArticleBackend::new();
+        for (mid, art) in mids.iter().zip(articles) {
+            inner.add(mid.clone(), art);
+        }
+        let gated = Arc::new(Gated {
+            inner,
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let provider = Arc::new(UsenetArticleProvider::with_fake(
+            Arc::clone(&gated) as Arc<dyn crate::provider::ArticleBackend>
+        ));
+        (provider, gated, mids, data)
+    }
+
+    async fn settle(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..2000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// The segment the reader needs next is fetched at demand; the rest of
+    /// the lookahead window is fetched at read-ahead.
+    #[tokio::test]
+    async fn head_is_demand_and_window_is_readahead() {
+        let (provider, gated, mids, data) = gated_provider(6);
+        let sem = provider.priority_semaphore();
+        let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids, 4);
+
+        settle("window in flight", || sem.held_total() == 4).await;
+        assert_eq!(sem.held(PermitTier::Demand), 1);
+        assert_eq!(sem.held(PermitTier::ReadAhead), 3);
+        assert_eq!(sem.held(PermitTier::Repair), 0);
+
+        gated.gate.add_permits(64);
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data);
+        assert_eq!(sem.held_total(), 0);
+    }
+
+    /// A read-ahead fetch still waiting for a permit is promoted to demand
+    /// once it becomes the head of the window, so playback is never stuck
+    /// behind read-ahead (or repair) for the segment it needs.
+    #[tokio::test]
+    async fn waiting_readahead_is_promoted_when_it_becomes_head() {
+        let (provider, gated, mids, data) = gated_provider(3);
+        let sem = provider.priority_semaphore();
+        // Saturate read-ahead so segments 1 and 2 must wait.
+        let mut others = Vec::new();
+        for _ in 0..3 {
+            others.push(sem.acquire_readahead().await);
+        }
+        let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids, 3);
+
+        settle("head on demand reserve", || {
+            sem.held(PermitTier::Demand) == 1 && sem.waiting(PermitTier::ReadAhead) == 2
+        })
+        .await;
+
+        // Finish segment 0: segment 1 becomes the head and takes the
+        // demand reserve; segment 2 keeps waiting at read-ahead.
+        gated.gate.add_permits(1);
+        settle("segment 1 promoted", || {
+            sem.held(PermitTier::Demand) == 1 && sem.waiting(PermitTier::ReadAhead) == 1
+        })
+        .await;
+        assert_eq!(sem.held(PermitTier::ReadAhead), 3);
+
+        drop(others);
+        gated.gate.add_permits(64);
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data);
+        assert_eq!(sem.held_total(), 0);
     }
 }

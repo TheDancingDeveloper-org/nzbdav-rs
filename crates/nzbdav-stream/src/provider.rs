@@ -144,15 +144,28 @@ impl UsenetArticleProvider {
             .await
     }
 
+    /// Read-ahead fetch that is promoted to demand if `promote` resolves
+    /// while it is still waiting for a permit — i.e. the reader caught up
+    /// and is now waiting on this segment. Once a permit is held the fetch
+    /// keeps its tier.
+    pub async fn fetch_decoded_promotable<F>(&self, message_id: &str, promote: F) -> Result<Vec<u8>>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let sem = self.priority_semaphore();
+        let _permit = tokio::select! {
+            biased;
+            () = promote => sem.acquire_high().await,
+            permit = sem.acquire_readahead() => permit,
+        };
+        self.fetch_decoded_permitted(message_id).await
+    }
+
     async fn fetch_decoded_with_priority(
         &self,
         message_id: &str,
         priority: FetchPriority,
     ) -> Result<Vec<u8>> {
-        if let Some(fake) = &self.fake {
-            return fake.fetch_decoded(message_id).await;
-        }
-
         let sem = self.priority_semaphore();
         let _permit = match priority {
             FetchPriority::High => sem.acquire_high().await,
@@ -160,6 +173,15 @@ impl UsenetArticleProvider {
             FetchPriority::Repair => sem.acquire_repair().await,
         };
 
+        self.fetch_decoded_permitted(message_id).await
+    }
+
+    /// Fetch once a permit is held. Fakes go through the semaphore too, so
+    /// tests can observe which tier a fetch ran at.
+    async fn fetch_decoded_permitted(&self, message_id: &str) -> Result<Vec<u8>> {
+        if let Some(fake) = &self.fake {
+            return fake.fetch_decoded(message_id).await;
+        }
         self.fetch_decoded_uncapped(message_id).await
     }
 
