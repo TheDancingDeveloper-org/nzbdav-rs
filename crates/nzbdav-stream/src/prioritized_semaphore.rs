@@ -10,9 +10,13 @@
 //!
 //! Two floors protect the lower-capacity tiers:
 //!
-//! - The **demand reserve** is set aside: read-ahead and repair never take
+//! - The **demand reserve** is set aside: ingest and repair never take
 //!   the last `demand_reserved - held(Demand)` free permits, so playback
-//!   always has headroom without having to preempt anyone.
+//!   always has headroom without having to preempt anyone. Read-ahead may
+//!   borrow the unused reserve while no demand waiter is queued, so a lone
+//!   stream on an idle pool can use every connection; the moment a demand
+//!   request queues, the next freed permit goes to it and read-ahead stops
+//!   borrowing.
 //! - The **repair floor** is guaranteed against read-ahead while repair is
 //!   active (a repair permit is held or one is waited for). Repair gets
 //!   freed permits ahead of read-ahead until it holds its floor, and
@@ -69,7 +73,15 @@ struct State {
     demand_reserved: usize,
     repair_floor: usize,
     held: [usize; PermitTier::COUNT],
-    waiters: [VecDeque<oneshot::Sender<PrioritizedPermit>>; PermitTier::COUNT],
+    /// Read-ahead permits held out of the demand reserve.
+    borrowed: usize,
+    waiters: [VecDeque<Waiter>; PermitTier::COUNT],
+}
+
+struct Waiter {
+    tx: oneshot::Sender<PrioritizedPermit>,
+    /// May borrow the unused demand reserve (read-ahead, not ingest).
+    borrows_reserve: bool,
 }
 
 impl State {
@@ -87,7 +99,7 @@ impl State {
 
     fn prune(&mut self) {
         for queue in &mut self.waiters {
-            queue.retain(|tx| !tx.is_closed());
+            queue.retain(|w| !w.tx.is_closed());
         }
     }
 
@@ -106,25 +118,36 @@ impl State {
         }
     }
 
-    /// The tier whose first waiter should get the next permit, if any can.
-    fn next_grantable(&self) -> Option<PermitTier> {
+    /// The tier and queue position of the waiter that should get the next
+    /// permit, if any can, and whether that permit borrows the reserve.
+    fn next_grantable(&self) -> Option<(PermitTier, usize, bool)> {
         let free = self.free();
         if free == 0 {
             return None;
         }
         if self.waiting(PermitTier::Demand) {
-            return Some(PermitTier::Demand);
+            return Some((PermitTier::Demand, 0, false));
         }
         let unmet_demand = self.unmet_demand();
+        // Repair's floor ranks above read-ahead, so the part of the reserve
+        // read-ahead has borrowed does not hold repair back from it.
+        let reserve_left = unmet_demand.saturating_sub(self.borrowed);
         let repair_below_floor = self.held[PermitTier::Repair.idx()] < self.repair_floor;
-        if self.waiting(PermitTier::Repair) && repair_below_floor && free > unmet_demand {
-            return Some(PermitTier::Repair);
+        if self.waiting(PermitTier::Repair) && repair_below_floor && free > reserve_left {
+            return Some((PermitTier::Repair, 0, false));
         }
-        if self.waiting(PermitTier::ReadAhead) && free > unmet_demand + self.unmet_repair() {
-            return Some(PermitTier::ReadAhead);
+        // No demand waiter is queued here, so read-ahead may borrow the
+        // unused reserve; ingest may not.
+        let unmet_repair = self.unmet_repair();
+        let readahead = self.waiters[PermitTier::ReadAhead.idx()]
+            .iter()
+            .position(|w| free > unmet_repair + if w.borrows_reserve { 0 } else { unmet_demand });
+        if let Some(pos) = readahead {
+            let borrowed = free <= unmet_repair + unmet_demand;
+            return Some((PermitTier::ReadAhead, pos, borrowed));
         }
         if self.waiting(PermitTier::Repair) && free > unmet_demand {
-            return Some(PermitTier::Repair);
+            return Some((PermitTier::Repair, 0, false));
         }
         None
     }
@@ -138,27 +161,31 @@ impl Inner {
     /// Hand free permits to waiters, highest priority first.
     fn dispatch(self: &Arc<Self>, state: &mut State) {
         state.prune();
-        while let Some(tier) = state.next_grantable() {
-            let Some(tx) = state.waiters[tier.idx()].pop_front() else {
+        while let Some((tier, pos, borrowed)) = state.next_grantable() {
+            let Some(Waiter { tx, .. }) = state.waiters[tier.idx()].remove(pos) else {
                 break;
             };
             state.held[tier.idx()] += 1;
+            state.borrowed += usize::from(borrowed);
             let permit = PrioritizedPermit {
                 inner: Some(Arc::clone(self)),
                 tier,
+                borrowed,
             };
             if let Err(mut permit) = tx.send(permit) {
                 // The waiter left between the prune and the send. Undo by
                 // hand: dropping the permit would re-lock the state.
                 permit.inner = None;
                 state.held[tier.idx()] -= 1;
+                state.borrowed -= usize::from(borrowed);
             }
         }
     }
 
-    fn release(self: &Arc<Self>, tier: PermitTier) {
+    fn release(self: &Arc<Self>, tier: PermitTier, borrowed: bool) {
         let mut state = self.state.lock();
         state.held[tier.idx()] -= 1;
+        state.borrowed -= usize::from(borrowed);
         self.dispatch(&mut state);
     }
 }
@@ -172,6 +199,7 @@ pub struct PrioritizedSemaphore {
 pub struct PrioritizedPermit {
     inner: Option<Arc<Inner>>,
     tier: PermitTier,
+    borrowed: bool,
 }
 
 impl PrioritizedPermit {
@@ -192,7 +220,7 @@ impl std::fmt::Debug for PrioritizedPermit {
 impl Drop for PrioritizedPermit {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            inner.release(self.tier);
+            inner.release(self.tier, self.borrowed);
         }
     }
 }
@@ -251,6 +279,7 @@ impl PrioritizedSemaphore {
                     demand_reserved: high_priority_reserved,
                     repair_floor,
                     held: [0; PermitTier::COUNT],
+                    borrowed: 0,
                     waiters: Default::default(),
                 }),
             }),
@@ -259,12 +288,21 @@ impl PrioritizedSemaphore {
 
     /// Wait for a permit at `tier`. Dropping the future gives up the place
     /// in line; a permit already granted to it is returned.
+    /// A read-ahead ask may borrow the unused demand reserve.
     pub async fn acquire(&self, tier: PermitTier) -> PrioritizedPermit {
+        self.acquire_inner(tier, tier == PermitTier::ReadAhead)
+            .await
+    }
+
+    async fn acquire_inner(&self, tier: PermitTier, borrows_reserve: bool) -> PrioritizedPermit {
         loop {
             let rx = {
                 let mut state = self.inner.state.lock();
                 let (tx, rx) = oneshot::channel();
-                state.waiters[tier.idx()].push_back(tx);
+                state.waiters[tier.idx()].push_back(Waiter {
+                    tx,
+                    borrows_reserve,
+                });
                 self.inner.dispatch(&mut state);
                 rx
             };
@@ -283,13 +321,15 @@ impl PrioritizedSemaphore {
     }
 
     /// Acquire a read-ahead permit: prefetch beyond the demanded segment.
+    /// May borrow the unused demand reserve while no demand waiter queues.
     pub async fn acquire_readahead(&self) -> PrioritizedPermit {
         self.acquire(PermitTier::ReadAhead).await
     }
 
-    /// Acquire an ingest permit. Ingest sits on the read-ahead tier.
+    /// Acquire an ingest permit. Ingest sits on the read-ahead tier but
+    /// never borrows the demand reserve.
     pub async fn acquire_low(&self) -> PrioritizedPermit {
-        self.acquire(PermitTier::ReadAhead).await
+        self.acquire_inner(PermitTier::ReadAhead, false).await
     }
 
     /// Acquire a repair permit: lowest tier, but guaranteed the repair floor
@@ -313,7 +353,7 @@ impl PrioritizedSemaphore {
         let state = self.inner.state.lock();
         state.waiters[tier.idx()]
             .iter()
-            .filter(|tx| !tx.is_closed())
+            .filter(|w| !w.tx.is_closed())
             .count()
     }
 
@@ -427,6 +467,25 @@ mod tests {
             .collect()
     }
 
+    /// Like [`spawn_holders`], for ingest asks (read-ahead tier, no
+    /// borrowing of the demand reserve).
+    fn spawn_ingest_holders(
+        sem: &Arc<PrioritizedSemaphore>,
+        n: usize,
+        release: &Arc<Notify>,
+    ) -> Vec<JoinHandle<()>> {
+        (0..n)
+            .map(|_| {
+                let sem = Arc::clone(sem);
+                let release = Arc::clone(release);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_low().await;
+                    release.notified().await;
+                })
+            })
+            .collect()
+    }
+
     /// Wait until `cond` holds, failing the test after a second.
     async fn settle(what: &str, mut cond: impl FnMut() -> bool) {
         timeout(Duration::from_secs(1), async {
@@ -523,10 +582,11 @@ mod tests {
     /// Acceptance: 20 permits, 15 demand waiters and 15 repair waiters.
     /// Repair holds at least 5 while demand is saturated. Both tiers are
     /// queued at the same time (interleaved, repair first) behind a full
-    /// pool, so they contend for every permit as it frees up.
-    #[tokio::test]
-    async fn repair_holds_floor_while_demand_saturated() {
-        let sem = Arc::new(PrioritizedSemaphore::new(20, 5));
+    /// pool, together with 15 read-ahead waiters, so they contend for every
+    /// permit as it frees up. Without the floor, read-ahead would take the
+    /// 5 permits demand leaves and repair would get none.
+    async fn repair_floor_under_saturated_demand(sem: PrioritizedSemaphore) -> usize {
+        let sem = Arc::new(sem);
         let unblock = Arc::new(Notify::new());
         let blockers = spawn_holders(&sem, PermitTier::Demand, 20, &unblock);
         settle("pool full", || sem.held_total() == 20).await;
@@ -535,10 +595,13 @@ mod tests {
         let mut tasks = Vec::new();
         for _ in 0..15 {
             tasks.extend(spawn_holders(&sem, PermitTier::Repair, 1, &release));
+            tasks.extend(spawn_holders(&sem, PermitTier::ReadAhead, 1, &release));
             tasks.extend(spawn_holders(&sem, PermitTier::Demand, 1, &release));
         }
-        settle("both tiers queued", || {
-            sem.waiting(PermitTier::Demand) == 15 && sem.waiting(PermitTier::Repair) == 15
+        settle("all tiers queued", || {
+            sem.waiting(PermitTier::Demand) == 15
+                && sem.waiting(PermitTier::Repair) == 15
+                && sem.waiting(PermitTier::ReadAhead) == 15
         })
         .await;
 
@@ -552,10 +615,8 @@ mod tests {
 
         settle("turnover", || sem.held_total() == 20).await;
         assert_eq!(sem.held(PermitTier::Demand), 15);
-        assert!(sem.held(PermitTier::Repair) >= 5);
-        assert_eq!(sem.held(PermitTier::Repair), 5);
         assert_eq!(sem.waiting(PermitTier::Demand), 0);
-        assert_eq!(sem.waiting(PermitTier::Repair), 10);
+        let repair = sem.held(PermitTier::Repair);
 
         for t in tasks {
             // Late holders missed the first notify; keep waking them.
@@ -566,30 +627,47 @@ mod tests {
             t.await.unwrap();
         }
         assert_eq!(sem.held_total(), 0);
+        repair
     }
 
-    /// Read-ahead cannot take repair's floor: as saturating read-ahead
-    /// holders turn over, freed permits go to repair until it holds its
-    /// floor, then read-ahead gets the rest.
+    #[tokio::test]
+    async fn repair_holds_floor_while_demand_saturated() {
+        let repair = repair_floor_under_saturated_demand(PrioritizedSemaphore::new(20, 5)).await;
+        assert!(repair >= 5, "repair held {repair}");
+    }
+
+    /// Control for the acceptance test: with no floor, repair gets nothing,
+    /// so the test above depends on the floor.
+    #[tokio::test]
+    async fn without_floor_readahead_takes_what_demand_leaves() {
+        let repair =
+            repair_floor_under_saturated_demand(PrioritizedSemaphore::with_repair_floor(20, 5, 0))
+                .await;
+        assert_eq!(repair, 0);
+    }
+
+    /// Ingest cannot take repair's floor: as saturating ingest holders turn
+    /// over, freed permits go to repair until it holds its floor, then
+    /// ingest gets the rest. Ingest never borrows the demand reserve.
     #[tokio::test]
     async fn readahead_cannot_take_repair_floor() {
         let sem = Arc::new(PrioritizedSemaphore::new(20, 5));
         let held: Vec<_> = {
             let mut v = Vec::new();
             for _ in 0..15 {
-                v.push(sem.acquire_readahead().await);
+                v.push(sem.acquire_low().await);
             }
             v
         };
-        // Read-ahead is at its share (20 - 5 reserved).
+        // Ingest is at its share (20 - 5 reserved).
         assert!(
-            timeout(Duration::from_millis(50), sem.acquire_readahead())
+            timeout(Duration::from_millis(50), sem.acquire_low())
                 .await
                 .is_err()
         );
 
         let release = Arc::new(Notify::new());
-        let mut tasks = spawn_holders(&sem, PermitTier::ReadAhead, 15, &release);
+        let mut tasks = spawn_ingest_holders(&sem, 15, &release);
         settle("read-ahead queued", || {
             sem.waiting(PermitTier::ReadAhead) == 15
         })
@@ -628,13 +706,59 @@ mod tests {
         assert_eq!(sem.held_total(), 0);
     }
 
+    /// Read-ahead borrowing the demand reserve still cannot take repair's
+    /// floor: turnover gives repair 5 and read-ahead the other 15.
+    #[tokio::test]
+    async fn borrowing_readahead_cannot_take_repair_floor() {
+        let sem = Arc::new(PrioritizedSemaphore::new(20, 5));
+        let held: Vec<_> = {
+            let mut v = Vec::new();
+            for _ in 0..20 {
+                v.push(sem.acquire_readahead().await);
+            }
+            v
+        };
+        let release = Arc::new(Notify::new());
+        let mut tasks = spawn_holders(&sem, PermitTier::ReadAhead, 20, &release);
+        settle("read-ahead queued", || {
+            sem.waiting(PermitTier::ReadAhead) == 20
+        })
+        .await;
+        tasks.extend(spawn_holders(&sem, PermitTier::Repair, 15, &release));
+        settle("repair queued", || sem.waiting(PermitTier::Repair) == 15).await;
+
+        drop(held);
+        settle("turnover", || sem.held_total() == 20).await;
+        assert_eq!(sem.held(PermitTier::Repair), 5);
+        assert_eq!(sem.held(PermitTier::ReadAhead), 15);
+
+        for t in tasks {
+            while !t.is_finished() {
+                release.notify_waiters();
+                tokio::task::yield_now().await;
+            }
+            t.await.unwrap();
+        }
+        assert_eq!(sem.held_total(), 0);
+    }
+
     #[tokio::test]
     async fn readahead_leaves_unmet_floor_free_while_repair_active() {
         let sem = PrioritizedSemaphore::new(20, 5);
         let _r = sem.acquire_repair().await;
-        // free must stay above unmet demand (5) + unmet repair (4).
+        // Ingest: free must stay above unmet demand (5) + unmet repair (4).
         let mut ra = Vec::new();
         for _ in 0..10 {
+            ra.push(sem.acquire_low().await);
+        }
+        assert!(
+            timeout(Duration::from_millis(50), sem.acquire_low())
+                .await
+                .is_err(),
+            "ingest must not take the unmet repair floor"
+        );
+        // Borrowing read-ahead may take the demand reserve, not the floor.
+        for _ in 0..5 {
             ra.push(sem.acquire_readahead().await);
         }
         assert!(
@@ -657,13 +781,70 @@ mod tests {
     async fn idle_repair_floor_costs_readahead_nothing() {
         let sem = PrioritizedSemaphore::new(20, 5);
         let mut ra = Vec::new();
-        for _ in 0..15 {
+        for _ in 0..20 {
             ra.push(
                 timeout(Duration::from_millis(100), sem.acquire_readahead())
                     .await
-                    .expect("read-ahead gets the whole shared pool"),
+                    .expect("idle read-ahead gets the whole pool"),
             );
         }
+    }
+
+    /// Read-ahead borrows the idle demand reserve, and gives way the moment
+    /// demand queues: the next freed permit goes to demand, and read-ahead
+    /// stops borrowing while demand waits.
+    #[tokio::test]
+    async fn readahead_borrows_reserve_until_demand_arrives() {
+        let sem = Arc::new(PrioritizedSemaphore::new(4, 1));
+        let mut ra = Vec::new();
+        for _ in 0..4 {
+            ra.push(sem.acquire_readahead().await);
+        }
+        let demand = {
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move { sem.acquire_high().await })
+        };
+        settle("demand waiter", || sem.waiting(PermitTier::Demand) == 1).await;
+        let more_ra = {
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move { sem.acquire_readahead().await })
+        };
+        settle("read-ahead waiter", || {
+            sem.waiting(PermitTier::ReadAhead) == 1
+        })
+        .await;
+
+        drop(ra.pop());
+        let permit = timeout(Duration::from_secs(1), demand)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.tier(), PermitTier::Demand);
+        assert_eq!(sem.waiting(PermitTier::ReadAhead), 1);
+        drop(permit);
+        let permit = timeout(Duration::from_secs(1), more_ra)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.tier(), PermitTier::ReadAhead);
+    }
+
+    #[tokio::test]
+    async fn ingest_never_borrows_demand_reserve() {
+        let sem = PrioritizedSemaphore::new(20, 5);
+        let mut held = Vec::new();
+        for _ in 0..15 {
+            held.push(sem.acquire_low().await);
+        }
+        assert!(
+            timeout(Duration::from_millis(50), sem.acquire_low())
+                .await
+                .is_err()
+        );
+        // A borrowing read-ahead behind it is not blocked by the ingest head.
+        timeout(Duration::from_millis(100), sem.acquire_readahead())
+            .await
+            .expect("read-ahead may borrow the reserve");
     }
 
     #[tokio::test]

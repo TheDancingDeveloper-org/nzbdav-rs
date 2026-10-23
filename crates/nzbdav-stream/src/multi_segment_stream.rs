@@ -28,6 +28,9 @@ pub struct MultiSegmentStream {
     buffer: BytesMut,
     bytes_read: Arc<AtomicU64>,
     done: bool,
+    /// Index of the segment the reader needs next; segments still waiting
+    /// for a permit are promoted to demand when it reaches them.
+    head: watch::Sender<usize>,
 }
 
 impl MultiSegmentStream {
@@ -50,11 +53,12 @@ impl MultiSegmentStream {
         // in flight at once; FuturesOrdered yields results in the original
         // submission order, preserving the stream's byte ordering.
         //
-        // Only the head of the window — the segment the reader needs next —
-        // is demand. Everything beyond it waits at the read-ahead tier and
+        // Only the head of the window — the segment the reader needs next
+        // (it advances as the reader consumes segments) — is demand. Everything beyond it waits at the read-ahead tier and
         // is promoted to demand if the head reaches it before it gets a
         // permit, so read-ahead never outranks repair.
         let concurrency = lookahead.max(1);
+        let (head_tx, head_rx) = watch::channel(0usize);
         let spawn_result = tokio::spawn(async move {
             debug!(
                 segments = segment_count,
@@ -63,7 +67,6 @@ impl MultiSegmentStream {
             let mut pending: FuturesOrdered<BoxFuture<'static, Result<Vec<u8>, StreamError>>> =
                 FuturesOrdered::new();
             let mut next_to_spawn = 0usize;
-            let (head_tx, head_rx) = watch::channel(0usize);
             let spawn_one = |idx: usize,
                              provider: &Arc<UsenetArticleProvider>,
                              segment_ids: &Vec<String>|
@@ -88,10 +91,7 @@ impl MultiSegmentStream {
                 next_to_spawn += 1;
             }
 
-            let mut head = 0usize;
             while let Some(result) = pending.next().await {
-                head += 1;
-                head_tx.send_replace(head);
                 if tx.send(result).await.is_err() {
                     debug!("receiver dropped, stopping prefetch");
                     return;
@@ -113,6 +113,7 @@ impl MultiSegmentStream {
             buffer: BytesMut::new(),
             bytes_read,
             done: false,
+            head: head_tx,
         }
     }
 
@@ -145,6 +146,7 @@ impl AsyncRead for MultiSegmentStream {
         // Try to receive the next segment from the prefetch task.
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(Ok(data))) => {
+                self.head.send_modify(|h| *h += 1);
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
                 self.bytes_read.fetch_add(to_copy as u64, Ordering::Relaxed);
@@ -252,16 +254,20 @@ mod tests {
         );
     }
 
-    /// Mock backend whose fetches each wait for a gate permit, on a
-    /// four-connection pool (1 demand reserve, read-ahead capped at 3).
+    /// Mock backend whose fetches each wait for a gate permit, on a pool of
+    /// `connections`.
     struct Gated {
         inner: MockArticleBackend,
         gate: tokio::sync::Semaphore,
+        connections: usize,
+        /// Fetches that reached the backend (holding a permit).
+        entered: AtomicU64,
     }
 
     #[async_trait::async_trait]
     impl crate::provider::ArticleBackend for Gated {
         async fn fetch_decoded(&self, m: &str) -> Result<Vec<u8>, StreamError> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
             self.gate.acquire().await.unwrap().forget();
             self.inner.fetch_decoded(m).await
         }
@@ -272,12 +278,13 @@ mod tests {
             self.inner.yenc_headers(m).await
         }
         fn total_connections(&self) -> usize {
-            4
+            self.connections
         }
     }
 
     fn gated_provider(
         segments: usize,
+        connections: usize,
     ) -> (Arc<UsenetArticleProvider>, Arc<Gated>, Vec<String>, Vec<u8>) {
         let data: Vec<u8> = (0..segments * 512).map(|i| (i % 251) as u8).collect();
         let parts: Vec<(u32, u64, usize)> = (0..segments)
@@ -292,6 +299,8 @@ mod tests {
         let gated = Arc::new(Gated {
             inner,
             gate: tokio::sync::Semaphore::new(0),
+            connections,
+            entered: AtomicU64::new(0),
         });
         let provider = Arc::new(UsenetArticleProvider::with_fake(
             Arc::clone(&gated) as Arc<dyn crate::provider::ArticleBackend>
@@ -313,7 +322,7 @@ mod tests {
     /// the lookahead window is fetched at read-ahead.
     #[tokio::test]
     async fn head_is_demand_and_window_is_readahead() {
-        let (provider, gated, mids, data) = gated_provider(6);
+        let (provider, gated, mids, data) = gated_provider(6, 4);
         let sem = provider.priority_semaphore();
         let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids, 4);
 
@@ -330,35 +339,75 @@ mod tests {
     }
 
     /// A read-ahead fetch still waiting for a permit is promoted to demand
-    /// once it becomes the head of the window, so playback is never stuck
-    /// behind read-ahead (or repair) for the segment it needs.
+    /// once the reader reaches it, so playback is never stuck behind
+    /// read-ahead (or repair) for the segment it needs.
     #[tokio::test]
-    async fn waiting_readahead_is_promoted_when_it_becomes_head() {
-        let (provider, gated, mids, data) = gated_provider(3);
+    async fn waiting_readahead_is_promoted_when_reader_reaches_it() {
+        let (provider, gated, mids, data) = gated_provider(3, 4);
         let sem = provider.priority_semaphore();
-        // Saturate read-ahead so segments 1 and 2 must wait.
+        // Take three of the four permits so segments 1 and 2 must wait.
         let mut others = Vec::new();
         for _ in 0..3 {
             others.push(sem.acquire_readahead().await);
         }
         let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids, 3);
-
-        settle("head on demand reserve", || {
+        settle("head on demand", || {
             sem.held(PermitTier::Demand) == 1 && sem.waiting(PermitTier::ReadAhead) == 2
         })
         .await;
 
-        // Finish segment 0: segment 1 becomes the head and takes the
-        // demand reserve; segment 2 keeps waiting at read-ahead.
-        gated.gate.add_permits(1);
-        settle("segment 1 promoted", || {
-            sem.held(PermitTier::Demand) == 1 && sem.waiting(PermitTier::ReadAhead) == 1
+        // Someone else's demand queues, so segment 0's permit goes there
+        // rather than being borrowed by read-ahead.
+        let outside = {
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move { sem.acquire_high().await })
+        };
+        settle("outside demand queued", || {
+            sem.waiting(PermitTier::Demand) == 1
         })
         .await;
+
+        // Finish and read segment 0: the reader now needs segment 1, which
+        // is promoted to demand while still waiting.
+        gated.gate.add_permits(1);
+        let mut first = vec![0u8; 512];
+        stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(first, data[..512]);
+        settle("segment 1 promoted", || {
+            sem.waiting(PermitTier::Demand) == 1
+        })
+        .await;
+        assert_eq!(sem.waiting(PermitTier::ReadAhead), 1);
+
+        // The outside permit frees: it goes to segment 1 at demand, not to
+        // the read-ahead segment 2.
+        drop(outside.await.unwrap());
+        settle("segment 1 granted", || sem.held(PermitTier::Demand) == 1).await;
         assert_eq!(sem.held(PermitTier::ReadAhead), 3);
+        assert_eq!(sem.waiting(PermitTier::ReadAhead), 1);
 
         drop(others);
         gated.gate.add_permits(64);
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data[512..]);
+        assert_eq!(sem.held_total(), 0);
+    }
+
+    /// A lone stream on an idle 20-connection pool uses all 20 connections:
+    /// read-ahead borrows the unused demand reserve.
+    #[tokio::test]
+    async fn lone_stream_uses_whole_idle_pool() {
+        let (provider, gated, mids, data) = gated_provider(40, 20);
+        let sem = provider.priority_semaphore();
+        let mut stream = MultiSegmentStream::new(Arc::clone(&provider), mids, 40);
+
+        settle("pool saturated", || sem.held_total() == 20).await;
+        assert_eq!(sem.held(PermitTier::Demand), 1);
+        assert_eq!(sem.held(PermitTier::ReadAhead), 19);
+        assert_eq!(gated.entered.load(Ordering::SeqCst), 20);
+
+        gated.gate.add_permits(1024);
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, data);
