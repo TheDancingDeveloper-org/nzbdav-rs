@@ -23,11 +23,19 @@ use crate::provider::UsenetArticleProvider;
 /// through the provider and sends decoded payloads through a bounded
 /// channel. The channel capacity equals `lookahead`, providing natural
 /// backpressure: the fetcher won't race too far ahead of the reader.
+///
+/// Fetches go through the provider's hole model, so a segment every pool
+/// refuses holds the reader for the confirming re-ask rather than failing
+/// at once; [`held_provisionally`](Self::held_provisionally) reports that.
 pub struct MultiSegmentStream {
     receiver: mpsc::Receiver<Result<Vec<u8>, StreamError>>,
     buffer: BytesMut,
     bytes_read: Arc<AtomicU64>,
     done: bool,
+    provider: Arc<UsenetArticleProvider>,
+    segment_ids: Arc<[String]>,
+    /// Segments handed to the reader so far; the next one is what it waits on.
+    delivered: usize,
 }
 
 impl MultiSegmentStream {
@@ -44,6 +52,8 @@ impl MultiSegmentStream {
     ) -> Self {
         let (tx, rx) = mpsc::channel(lookahead);
         let bytes_read = Arc::new(AtomicU64::new(0));
+        let ids: Arc<[String]> = segment_ids.clone().into();
+        let reader_provider = Arc::clone(&provider);
 
         let segment_count = segment_ids.len();
         // Parallel, in-order prefetch. Up to `lookahead` fetches can be
@@ -94,7 +104,22 @@ impl MultiSegmentStream {
             buffer: BytesMut::new(),
             bytes_read,
             done: false,
+            provider: reader_provider,
+            segment_ids: ids,
+            delivered: 0,
         }
+    }
+
+    /// Whether the reader is blocked on a segment held on a provisional
+    /// refusal while its confirm is in flight. Such a reader must be left
+    /// out of any hedging or second-ask logic: it is already being re-asked.
+    pub fn held_provisionally(&self) -> bool {
+        !self.done
+            && self.buffer.is_empty()
+            && self
+                .segment_ids
+                .get(self.delivered)
+                .is_some_and(|id| self.provider.held_provisionally(id))
     }
 
     /// Total bytes that have been read out of this stream so far.
@@ -126,6 +151,7 @@ impl AsyncRead for MultiSegmentStream {
         // Try to receive the next segment from the prefetch task.
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(Ok(data))) => {
+                self.delivered += 1;
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
                 self.bytes_read.fetch_add(to_copy as u64, Ordering::Relaxed);

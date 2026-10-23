@@ -26,6 +26,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::holes::{HoleLedger, HoleState, Outcome};
 use crate::prioritized_semaphore::PrioritizedPermit;
 use crate::provider::{PoolStat, UsenetArticleProvider};
 
@@ -101,66 +102,6 @@ impl CensusBackend for UsenetArticleProvider {
 
     async fn acquire_low(&self) -> Option<PrioritizedPermit> {
         Some(self.priority_semaphore().acquire_low().await)
-    }
-}
-
-/// State of a hole in the ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoleState {
-    /// Seen missing, not yet confirmed; counts as uncertain damage.
-    Provisional,
-    /// Confirmed missing; counts as damage.
-    Confirmed,
-}
-
-/// The damage ledger the census feeds. The hole model decides when a miss
-/// becomes a confirmed hole.
-pub trait HoleLedger: Send + Sync {
-    /// Every pool answered 430 for this article.
-    fn record_miss(&self, message_id: &str) -> HoleState;
-    /// Some pool failed to answer and none had the article. Never a miss.
-    fn record_unestablished(&self, message_id: &str);
-    /// Some pool has the article; any hole on it is closed.
-    fn record_present(&self, message_id: &str);
-}
-
-/// In-memory ledger: a hole is provisional on its first miss and confirmed
-/// by a miss at least `confirm_after` later. A zero delay confirms at once.
-pub struct InMemoryHoleLedger {
-    confirm_after: Duration,
-    holes: Mutex<HashMap<String, (Instant, HoleState)>>,
-}
-
-impl InMemoryHoleLedger {
-    pub fn new(confirm_after: Duration) -> Self {
-        Self {
-            confirm_after,
-            holes: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn state(&self, message_id: &str) -> Option<HoleState> {
-        self.holes.lock().get(message_id).map(|(_, s)| *s)
-    }
-}
-
-impl HoleLedger for InMemoryHoleLedger {
-    fn record_miss(&self, message_id: &str) -> HoleState {
-        let now = Instant::now();
-        let mut holes = self.holes.lock();
-        let entry = holes
-            .entry(message_id.to_string())
-            .or_insert((now, HoleState::Provisional));
-        if now.duration_since(entry.0) >= self.confirm_after {
-            entry.1 = HoleState::Confirmed;
-        }
-        entry.1
-    }
-
-    fn record_unestablished(&self, _message_id: &str) {}
-
-    fn record_present(&self, message_id: &str) {
-        self.holes.lock().remove(message_id);
     }
 }
 
@@ -397,9 +338,10 @@ impl DamageCensus {
         };
 
         let ids = surveyed_ids(target);
-        let (states, pool_failures) = self.settle(&ids).await;
+        let servers = self.servers();
+        let (states, pool_failures) = self.settle(&ids, &servers).await;
 
-        let mut report = assess(target, trigger, &states, self.ledger.as_ref());
+        let mut report = assess(target, trigger, &states, self.ledger.as_ref(), &servers);
         report.pool_failures = pool_failures;
 
         let clean = matches!(
@@ -425,8 +367,19 @@ impl DamageCensus {
         Ok(report)
     }
 
+    /// Pool names in priority order; they fingerprint ledger records.
+    fn servers(&self) -> Vec<String> {
+        (0..self.backend.pool_count())
+            .map(|pool| self.backend.pool_name(pool))
+            .collect()
+    }
+
     /// Settle every id, from the cache where fresh, else across the pools.
-    async fn settle(&self, ids: &[String]) -> (HashMap<String, ArticleState>, Vec<PoolFailures>) {
+    async fn settle(
+        &self,
+        ids: &[String],
+        servers: &[String],
+    ) -> (HashMap<String, ArticleState>, Vec<PoolFailures>) {
         let mut states = HashMap::with_capacity(ids.len());
         let mut pending = Vec::new();
         {
@@ -515,12 +468,11 @@ impl DamageCensus {
         }
         drop(cache);
 
+        // Misses go to the ledger in `assess`, which needs the state. An
+        // unestablished article is never a miss and leaves the ledger alone.
         for (id, state) in &states {
-            match state {
-                ArticleState::Present => self.ledger.record_present(id),
-                ArticleState::Unestablished => self.ledger.record_unestablished(id),
-                // Misses go to the ledger in `assess`, which needs the state.
-                ArticleState::Missing => {}
+            if *state == ArticleState::Present {
+                self.ledger.note(id, &Outcome::Present, servers);
             }
         }
         (states, failures)
@@ -599,6 +551,7 @@ fn assess(
     trigger: CensusTrigger,
     states: &HashMap<String, ArticleState>,
     ledger: &dyn HoleLedger,
+    servers: &[String],
 ) -> CensusReport {
     let mut missing_ids = Vec::new();
     let mut unestablished_ids = Vec::new();
@@ -620,7 +573,15 @@ fn assess(
             }
             ArticleState::Missing => {
                 missing_ids.push(id.clone());
-                match ledger.record_miss(id) {
+                // Every pool answered 430: one refusal per server.
+                let mut hole = None;
+                for server in servers {
+                    let refused = Outcome::Refused {
+                        server: server.clone(),
+                    };
+                    hole = ledger.note(id, &refused, servers).state;
+                }
+                match hole.unwrap_or(HoleState::Provisional) {
                     HoleState::Confirmed => Loss::Certain,
                     HoleState::Provisional => {
                         provisional_ids.push(id.clone());
@@ -760,6 +721,7 @@ pub fn settle_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::holes::InMemoryHoleLedger;
 
     /// Per-pool canned answers; unknown ids are absent.
     struct FakePools {
