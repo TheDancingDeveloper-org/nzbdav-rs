@@ -29,7 +29,7 @@ pub use holes::{
 pub use multi_segment_stream::MultiSegmentStream;
 pub use multipart_file_stream::DavMultipartFileStream;
 pub use nzb_file_stream::NzbFileStream;
-pub use prioritized_semaphore::{PrioritizedPermit, PrioritizedSemaphore};
+pub use prioritized_semaphore::{PermitTier, PrioritizedPermit, PrioritizedSemaphore};
 pub use provider::{HoleConfig, PoolStat, UsenetArticleProvider, YencHeaders};
 pub use seekable_segment_stream::SeekableSegmentStream;
 
