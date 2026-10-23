@@ -67,6 +67,11 @@ impl HealthCheckService {
         self
     }
 
+    /// Whether items are checked by a damage census.
+    pub fn has_census(&self) -> bool {
+        self.census.is_some()
+    }
+
     /// Run the health check loop until cancelled.
     pub async fn run(&self) {
         info!(

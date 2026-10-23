@@ -309,9 +309,14 @@ impl DamageCensus {
         self.cache.lock().len()
     }
 
-    /// STATs every census together may run against one pool at once.
+    /// STATs every census together may run against one pool at once. A
+    /// pool with a single connection gets none: that connection is left to
+    /// playback and the census skips the pool.
     pub fn pool_width(&self, pool: usize) -> usize {
         let connections = self.backend.pool_connections(pool);
+        if connections < 2 {
+            return 0;
+        }
         let share = connections.saturating_mul(self.config.max_pool_share_percent) / 100;
         self.config.max_in_flight_per_pool.min(share).max(1)
     }
@@ -535,6 +540,13 @@ impl DamageCensus {
     /// STAT `ids` on one pool, pipelined; answers come back in `ids` order.
     async fn stat_pass(&self, pool: usize, ids: &[String]) -> Vec<PoolStat> {
         let (width, slots) = self.pool_slots(pool);
+        if width == 0 {
+            let skipped = "census skips a single-connection pool, leaving it to playback";
+            return ids
+                .iter()
+                .map(|_| PoolStat::Failed(skipped.into()))
+                .collect();
+        }
         let consecutive = Arc::new(AtomicUsize::new(0));
         let trip = self.config.pool_trip_after.max(1);
         let timeout = self.config.stat_timeout;
@@ -1263,6 +1275,28 @@ mod tests {
         assert!(census.cached_articles() > 0);
     }
 
+    /// A census never STATs a single-connection pool: its only connection
+    /// stays with playback, and the pool's articles stay unestablished.
+    #[tokio::test]
+    async fn single_connection_pool_is_left_to_playback() {
+        let mut pools = FakePools::new(1);
+        pools.connections = 1;
+        let backend = Arc::new(pools);
+        let census = DamageCensus::new(backend.clone(), confirm_now(), CensusConfig::default());
+        let target = CensusTarget {
+            key: "k".into(),
+            files: vec![file("f", &["a", "b"], 10)],
+            recovery: None,
+        };
+        let report = census.run(&target, CensusTrigger::Operator).await.unwrap();
+        assert!(
+            backend.calls_on(0).is_empty(),
+            "no STAT on the only connection"
+        );
+        assert_eq!(report.unestablished_ids, vec!["a", "b"]);
+        assert!(report.missing_ids.is_empty());
+    }
+
     /// Censuses of different releases share one pool's slots: with 8
     /// connections and a 25% share, no more than 2 STATs run on the pool at
     /// once, however many censuses are running.
@@ -1304,7 +1338,12 @@ mod tests {
             pools.connections = connections;
             DamageCensus::new(Arc::new(pools), confirm_now(), CensusConfig::default())
         };
-        assert_eq!(census(1).pool_width(0), 1);
+        assert_eq!(
+            census(1).pool_width(0),
+            0,
+            "the only connection stays with playback"
+        );
+        assert_eq!(census(2).pool_width(0), 1);
         assert_eq!(census(4).pool_width(0), 1);
         assert_eq!(census(8).pool_width(0), 2);
         assert_eq!(census(20).pool_width(0), 5);

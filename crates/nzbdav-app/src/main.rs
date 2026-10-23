@@ -97,6 +97,15 @@ async fn main() -> anyhow::Result<()> {
         cancel.clone(),
     );
 
+    // Health check, triggering a damage census per checked item.
+    let health_check =
+        state::health_check_service(db.clone(), provider.clone(), census.clone(), cancel.clone());
+    assert!(
+        health_check.has_census(),
+        "health check must carry the census"
+    );
+    tokio::spawn(async move { health_check.run().await });
+
     // 6. Build shared state
     let app_state = AppState {
         db: db.clone(),
