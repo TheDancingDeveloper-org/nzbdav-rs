@@ -23,10 +23,13 @@ cbc = { workspace = true }
 async-trait = { workspace = true }
 crc32fast = { workspace = true }
 futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 nzb-nntp = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
 
 [lints]
 workspace = true

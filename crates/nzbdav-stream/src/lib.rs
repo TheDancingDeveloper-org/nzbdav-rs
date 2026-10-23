@@ -11,6 +11,7 @@ pub mod holes;
 pub mod multi_segment_stream;
 pub mod multipart_file_stream;
 pub mod nzb_file_stream;
+pub mod patches;
 pub mod prioritized_semaphore;
 pub mod provider;
 pub mod recovery_set;
@@ -30,6 +31,7 @@ pub use holes::{
 pub use multi_segment_stream::MultiSegmentStream;
 pub use multipart_file_stream::DavMultipartFileStream;
 pub use nzb_file_stream::NzbFileStream;
+pub use patches::{PatchError, PatchStamp, PatchStore, PatchTotals};
 pub use prioritized_semaphore::{PermitTier, PrioritizedPermit, PrioritizedSemaphore};
 pub use provider::{HoleConfig, PoolStat, UsenetArticleProvider, YencHeaders};
 pub use recovery_set::{census_files, load_recovery_sets};

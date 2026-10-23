@@ -32,7 +32,7 @@ use nzbdav_core::config::ConfigManager;
 use nzbdav_core::sqlite_db::SqliteDavDatabase;
 use nzbdav_core::{db, seed};
 use nzbdav_dav::{DatabaseStore, dav_router};
-use nzbdav_stream::UsenetArticleProvider;
+use nzbdav_stream::{PatchStore, UsenetArticleProvider};
 
 use cli::Cli;
 use log_capture::{CaptureLayer, LogBuffer};
@@ -71,7 +71,20 @@ async fn main() -> anyhow::Result<()> {
     config.load_from_db(&db.lock())?;
 
     // 4. Usenet provider
-    let provider = Arc::new(UsenetArticleProvider::new(vec![]));
+    let mut provider = UsenetArticleProvider::new(vec![]);
+    // Repaired spans live beside the database so they survive a restart.
+    let patch_dir = std::path::Path::new(&cli.db_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("patches");
+    match PatchStore::from_setting(config.get_par2_patch_cache_mb(), &patch_dir) {
+        Ok(Some(store)) => provider = provider.with_patches(Arc::new(store)),
+        Ok(None) => tracing::info!("PAR2 patch store disabled"),
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %patch_dir.display(), "PAR2 patch store unavailable")
+        }
+    }
+    let provider = Arc::new(provider);
 
     let dav_store = Arc::new(DatabaseStore::new(
         dav_db.clone() as Arc<dyn nzbdav_core::database::DavDatabase>,

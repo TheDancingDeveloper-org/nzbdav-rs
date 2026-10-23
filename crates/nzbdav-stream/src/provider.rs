@@ -16,8 +16,10 @@ use tracing::{debug, warn};
 
 use crate::error::{Result, StreamError};
 use crate::holes::{
-    Consult, HOLE_CONFIRM_DELAY, HOLE_CONFIRM_FETCH, HoleLedger, InMemoryHoleLedger, Noted, Outcome,
+    Consult, HOLE_CONFIRM_DELAY, HOLE_CONFIRM_FETCH, HoleLedger, HoleState, InMemoryHoleLedger,
+    Noted, Outcome,
 };
+use crate::patches::PatchStore;
 use crate::prioritized_semaphore::{PrioritizedPermit, PrioritizedSemaphore};
 
 /// Fraction of connection capacity reserved for high-priority (WebDAV
@@ -107,6 +109,8 @@ pub struct UsenetArticleProvider {
     /// Confirms in flight, by message-id; readers of a provisional article
     /// wait on these.
     confirms: Mutex<HashMap<String, watch::Receiver<Option<Attempt>>>>,
+    /// Repaired spans served in place of confirmed holes.
+    patches: Option<Arc<PatchStore>>,
 }
 
 impl UsenetArticleProvider {
@@ -119,6 +123,7 @@ impl UsenetArticleProvider {
             ledger: Arc::new(InMemoryHoleLedger::default()),
             hole_config: HoleConfig::default(),
             confirms: Mutex::new(HashMap::new()),
+            patches: None,
         }
     }
 
@@ -127,6 +132,30 @@ impl UsenetArticleProvider {
     pub fn with_ledger(mut self, ledger: Arc<dyn HoleLedger>) -> Self {
         self.ledger = ledger;
         self
+    }
+
+    /// Serve repaired spans from `patches` in place of confirmed holes.
+    pub fn with_patches(mut self, patches: Arc<PatchStore>) -> Self {
+        self.patches = Some(patches);
+        self
+    }
+
+    /// The patch store, if one is attached.
+    pub fn patches(&self) -> Option<Arc<PatchStore>> {
+        self.patches.clone()
+    }
+
+    /// The repaired bytes of an article that is a confirmed hole, if a patch
+    /// covers it. A provisional or unknown article is never patched: it may
+    /// still come back from a server.
+    pub async fn patched(&self, message_id: &str) -> Option<Vec<u8>> {
+        let patches = self.patches.as_ref()?;
+        if self.ledger.state(message_id) != Some(HoleState::Confirmed) {
+            return None;
+        }
+        let bytes = patches.read_article(message_id).await?;
+        debug!(message_id, len = bytes.len(), "serving patched article");
+        Some(bytes)
     }
 
     /// Override the confirming re-ask tunables.
@@ -752,7 +781,7 @@ enum FetchPriority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::holes::{HOLE_TTL, HoleState};
+    use crate::holes::HOLE_TTL;
     use crate::prioritized_semaphore::PermitTier;
 
     #[tokio::test]
