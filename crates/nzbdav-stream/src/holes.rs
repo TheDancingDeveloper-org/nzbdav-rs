@@ -23,11 +23,16 @@
 //! Callers translate their own failures into an [`Outcome`] before calling
 //! [`HoleLedger::note`]: a body is [`Outcome::Present`], a `430` is
 //! [`Outcome::Refused`] and everything else is [`Outcome::Transport`].
+//!
+//! Confirmed holes outlive the process as [`StoredHole`]s, kept by the patch
+//! store with the release they belong to; a new process hands them back to
+//! its ledger with [`HoleLedger::restore`].
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -112,6 +117,74 @@ pub struct HoleRecord {
     pub server_fingerprint: String,
 }
 
+/// A confirmed hole in its on-disk form: wall-clock times, since an
+/// [`Instant`] means nothing to the next process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredHole {
+    pub message_id: String,
+    pub refused_by: Vec<String>,
+    pub unreachable: Vec<String>,
+    pub server_fingerprint: String,
+    pub first_refused_at_ms: u64,
+    pub confirmed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+impl StoredHole {
+    /// The on-disk form of a confirmed hole; `None` for a provisional one,
+    /// which is not evidence enough to keep.
+    pub fn from_record(record: &HoleRecord) -> Option<Self> {
+        if record.state != HoleState::Confirmed {
+            return None;
+        }
+        let confirmed_at = record.confirmed_at?;
+        Some(Self {
+            message_id: record.message_id.clone(),
+            refused_by: record.refused_by.clone(),
+            unreachable: record.unreachable.clone(),
+            server_fingerprint: record.server_fingerprint.clone(),
+            first_refused_at_ms: unix_ms(record.first_refused_at),
+            confirmed_at_ms: unix_ms(confirmed_at),
+            expires_at_ms: record.expires_at.map_or(unix_ms(confirmed_at), unix_ms),
+        })
+    }
+
+    /// Whether the hole's TTL ran out by the wall clock.
+    pub fn expired(&self) -> bool {
+        now_ms() >= self.expires_at_ms
+    }
+}
+
+/// Milliseconds since the Unix epoch, now.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// An instant as milliseconds since the Unix epoch.
+fn unix_ms(at: Instant) -> u64 {
+    let now = Instant::now();
+    let now_ms = now_ms();
+    if at <= now {
+        now_ms.saturating_sub(now.duration_since(at).as_millis() as u64)
+    } else {
+        now_ms + at.duration_since(now).as_millis() as u64
+    }
+}
+
+/// Milliseconds since the Unix epoch as an instant of this process.
+fn instant_at(ms: u64) -> Instant {
+    let now = Instant::now();
+    let now_ms = now_ms();
+    if ms <= now_ms {
+        now.checked_sub(Duration::from_millis(now_ms - ms))
+            .unwrap_or(now)
+    } else {
+        now + Duration::from_millis(ms - now_ms)
+    }
+}
+
 /// The damage ledger. The provider consults it before a fetch and notes
 /// every outcome; the damage census and the repair job read and feed it.
 pub trait HoleLedger: Send + Sync {
@@ -124,6 +197,10 @@ pub trait HoleLedger: Send + Sync {
     fn state(&self, message_id: &str) -> Option<HoleState>;
     /// Every hole on record.
     fn holes(&self) -> Vec<HoleRecord>;
+    /// Take back a confirmed hole a previous process recorded. An expired
+    /// one, or an article the ledger already has a record of, is ignored.
+    /// A ledger that cannot hold restored records ignores them all.
+    fn restore(&self, _hole: &StoredHole) {}
 }
 
 /// A stable fingerprint of the set of servers that were asked.
@@ -443,6 +520,42 @@ impl HoleLedger for InMemoryHoleLedger {
         out.sort_by(|a, b| a.message_id.cmp(&b.message_id));
         out
     }
+
+    fn restore(&self, hole: &StoredHole) {
+        if hole.expired() {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        if inner.holes.contains_key(&hole.message_id) {
+            return;
+        }
+        self.make_room(&mut inner, now);
+        let touched = inner.tick();
+        let evidence = hole
+            .refused_by
+            .iter()
+            .map(|s| (s.clone(), Evidence::Refused))
+            .chain(
+                hole.unreachable
+                    .iter()
+                    .map(|s| (s.clone(), Evidence::Transport)),
+            )
+            .collect();
+        inner.holes.insert(
+            hole.message_id.clone(),
+            Entry {
+                state: HoleState::Confirmed,
+                evidence,
+                first_refused_at: instant_at(hole.first_refused_at_ms),
+                confirmed_at: Some(instant_at(hole.confirmed_at_ms)),
+                expires_at: Some(instant_at(hole.expires_at_ms)),
+                fingerprint: hole.server_fingerprint.clone(),
+                reprobe_claimed_at: None,
+                touched,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -652,6 +765,50 @@ mod tests {
             ledger.note(&format!("more{i}"), &refused("a"), &s);
             assert!(ledger.len() <= 10);
         }
+    }
+
+    /// A confirmed hole survives the trip through its on-disk form: the
+    /// next ledger skips it, with the same servers and TTL. Provisional and
+    /// expired holes are not restored.
+    #[tokio::test]
+    async fn stored_hole_restores_as_confirmed() {
+        let s = servers(&["a", "b"]);
+        let ledger = InMemoryHoleLedger::new(Duration::ZERO);
+        ledger.note("x", &refused("a"), &s);
+        ledger.note("x", &transport("b"), &s);
+        ledger.note("y", &refused("a"), &s);
+        ledger.note("y", &refused("b"), &s);
+        let records = ledger.holes();
+        assert_eq!(records.len(), 2);
+        assert!(
+            StoredHole::from_record(&records[0]).is_none(),
+            "x is provisional"
+        );
+        let stored = StoredHole::from_record(&records[1]).unwrap();
+        assert_eq!(stored.refused_by, s);
+        assert!(!stored.expired());
+        // Round-trips through JSON.
+        let stored: StoredHole =
+            serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let next = InMemoryHoleLedger::default();
+        next.restore(&stored);
+        assert_eq!(next.state("y"), Some(HoleState::Confirmed));
+        assert_eq!(next.consult("y", &s), Consult::Skip);
+        let restored = &next.holes()[0];
+        assert_eq!(restored.refused_by, s);
+        let ttl = restored.expires_at.unwrap() - restored.confirmed_at.unwrap();
+        assert!(ttl.abs_diff(HOLE_TTL) < Duration::from_millis(5), "{ttl:?}");
+        // Another server set does not trust it.
+        assert_eq!(next.consult("y", &servers(&["a"])), Consult::Fetch);
+
+        let expired = StoredHole {
+            message_id: "z".into(),
+            expires_at_ms: now_ms() - 1,
+            ..stored
+        };
+        next.restore(&expired);
+        assert_eq!(next.state("z"), None);
     }
 
     #[test]

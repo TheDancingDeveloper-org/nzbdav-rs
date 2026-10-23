@@ -25,13 +25,13 @@ pub use census::{
 };
 pub use error::{Result, StreamError};
 pub use holes::{
-    Consult, HoleLedger, HoleRecord, HoleState, InMemoryHoleLedger, Noted, Outcome,
+    Consult, HoleLedger, HoleRecord, HoleState, InMemoryHoleLedger, Noted, Outcome, StoredHole,
     server_fingerprint,
 };
 pub use multi_segment_stream::MultiSegmentStream;
 pub use multipart_file_stream::DavMultipartFileStream;
 pub use nzb_file_stream::NzbFileStream;
-pub use patches::{PatchError, PatchStamp, PatchStore, PatchTotals};
+pub use patches::{PatchError, PatchStamp, PatchStore, PatchTotals, ReleaseVerdict};
 pub use prioritized_semaphore::{PermitTier, PrioritizedPermit, PrioritizedSemaphore};
 pub use provider::{HoleConfig, PoolStat, UsenetArticleProvider, YencHeaders};
 pub use recovery_set::{census_files, load_recovery_sets};

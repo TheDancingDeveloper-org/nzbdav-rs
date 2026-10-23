@@ -1,5 +1,6 @@
 //! The patch store: byte spans the repair job rebuilt from PAR2, served in
-//! place of a confirmed hole.
+//! place of a confirmed hole, with the release's hole records and terminal
+//! verdict.
 //!
 //! Semantics follow zurg's `patchdisk.go`:
 //!
@@ -11,25 +12,38 @@
 //!   blob drops the release's older patches: they were rebuilt from another
 //!   NZB and may not match the articles any more.
 //! - The store has a byte budget. Past it, whole releases are evicted, least
-//!   recently read first, so a release's patches go together.
+//!   recently read first, so a release's patches go together. The budget
+//!   counts the span bytes and what the store holds in memory to find them:
+//!   the per-file article index, hole records and verdicts.
 //! - The read path asks by article: [`PatchStore::read_article`] returns the
 //!   article's decoded bytes when patches cover its whole span in the file,
 //!   and nothing otherwise, so a reader never sees a torn article.
+//! - A release also keeps its confirmed holes ([`StoredHole`]) and its
+//!   terminal [`ReleaseVerdict`], so the next process knows them without
+//!   asking the servers again (zurg measured 934 hopeless repair attempts
+//!   over 508 releases in three hours while verdicts lived in memory only).
 //!
 //! Patches are typically megabytes and must survive a restart (the repair
 //! that produced them costs a PAR2 volume download and a rebuild), so the
-//! store keeps them as files under the data dir rather than in SQLite rows:
-//! a span is written to a temporary file and renamed into place, so a crash
-//! never leaves a partial span, and eviction or deletion is an `unlink` that
-//! a reader with the span already open is unaffected by. An in-memory store
-//! with the same rules exists for `par2_patch_cache_mb = -1` and for tests.
+//! store keeps them as files under the data dir rather than in SQLite rows.
+//! A span is written to the incoming directory first and renamed into the
+//! release under the store's lock, so a crash never leaves a partial span and
+//! a span is indexed only once its file is in place. A release is deleted by
+//! renaming its directory into the trash under the lock and removing it
+//! after, so a write cannot land in a directory that is about to go, and a
+//! reader with a span already open is unaffected. An in-memory store with
+//! the same rules exists for `par2_patch_cache_mb = -1` and for tests.
 //!
 //! On-disk layout under the store's directory:
 //!
 //! ```text
 //! <release uuid>/stamp.json
-//! <release uuid>/<file key>/layout.json      file name and article spans
+//! <release uuid>/holes.json                 confirmed holes
+//! <release uuid>/verdict.json               terminal verdict
+//! <release uuid>/<file key>/layout.json     file name and article spans
 //! <release uuid>/<file key>/<offset>-<len>.bin
+//! .incoming/                                spans being written
+//! .trash/                                   releases being deleted
 //! ```
 //!
 //! The file key is a UUIDv5 of the file name, so any name is safe on disk.
@@ -48,14 +62,28 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::census::{ArticleSpan, CensusFile};
+use crate::holes::{HoleRecord, StoredHole, now_ms, server_fingerprint};
 
 /// Default budget, in MiB (`par2_patch_cache_mb`).
 pub const DEFAULT_PATCH_CACHE_MB: i64 = 512;
 
 const STAMP_FILE: &str = "stamp.json";
+const HOLES_FILE: &str = "holes.json";
+const VERDICT_FILE: &str = "verdict.json";
 const LAYOUT_FILE: &str = "layout.json";
 const SPAN_EXT: &str = "bin";
 const TMP_EXT: &str = "tmp";
+const INCOMING_DIR: &str = ".incoming";
+const TRASH_DIR: &str = ".trash";
+
+/// Budget charged per article of a patched file, on top of its message-id
+/// (held twice: in the layout and as the index key) and the file name (held
+/// by its index entry).
+const ARTICLE_INDEX_COST: u64 = 96;
+/// Budget charged per patched file, on top of its name.
+const FILE_INDEX_COST: u64 = 128;
+/// Budget charged per hole record or verdict, on top of its strings.
+const RECORD_COST: u64 = 64;
 
 /// What a release's patches were rebuilt from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +94,36 @@ pub struct PatchStamp {
     /// The servers asked when the hole was confirmed
     /// ([`crate::holes::server_fingerprint`]).
     pub server_fingerprint: String,
+}
+
+/// The settled outcome of repairing a release that is not worth trying
+/// again: what was found, which servers were asked, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseVerdict {
+    /// What the repair concluded, e.g. `beyond_repair: 12 slices lost, 4
+    /// recovery blocks`.
+    pub diagnosis: String,
+    /// The servers that were asked.
+    pub servers: Vec<String>,
+    /// When, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+}
+
+impl ReleaseVerdict {
+    /// A verdict reached now against `servers`.
+    pub fn new(diagnosis: impl Into<String>, servers: &[String]) -> Self {
+        Self {
+            diagnosis: diagnosis.into(),
+            servers: servers.to_vec(),
+            at_ms: now_ms(),
+        }
+    }
+
+    /// Whether the verdict was reached against the same set of servers. A
+    /// server added since may hold what the others lost.
+    pub fn applies_to(&self, servers: &[String]) -> bool {
+        server_fingerprint(&self.servers) == server_fingerprint(servers)
+    }
 }
 
 /// Why an insert was refused.
@@ -95,7 +153,13 @@ pub enum PatchError {
 pub struct PatchTotals {
     pub releases: usize,
     pub spans: usize,
+    /// Span bytes.
+    pub patch_bytes: u64,
+    /// Article index, hole records and verdicts.
+    pub index_bytes: u64,
+    /// Held in memory: the index, and the spans of an in-memory store.
     pub memory_bytes: u64,
+    /// Span bytes on disk.
     pub disk_bytes: u64,
     pub budget_bytes: u64,
 }
@@ -129,9 +193,44 @@ struct Release {
     stamp: PatchStamp,
     /// By file name.
     files: HashMap<String, FilePatches>,
-    bytes: u64,
+    /// Confirmed holes, by message-id order of arrival.
+    holes: Vec<StoredHole>,
+    verdict: Option<ReleaseVerdict>,
+    /// Span bytes.
+    data_bytes: u64,
+    /// Index, hole and verdict bytes charged to the budget.
+    meta_bytes: u64,
     /// Recency on the store's clock; bumped under the read lock.
     last_read: AtomicU64,
+}
+
+impl Release {
+    fn new(stamp: PatchStamp, now: u64) -> Self {
+        Self {
+            stamp,
+            files: HashMap::new(),
+            holes: Vec::new(),
+            verdict: None,
+            data_bytes: 0,
+            meta_bytes: 0,
+            last_read: AtomicU64::new(now),
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.data_bytes + self.meta_bytes
+    }
+
+    fn files_cost(&self) -> u64 {
+        self.files
+            .values()
+            .map(|f| file_cost(&f.name, &f.articles))
+            .sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.holes.is_empty() && self.verdict.is_none()
+    }
 }
 
 /// Where an article sits in a patched file.
@@ -148,11 +247,16 @@ struct Inner {
     releases: HashMap<Uuid, Release>,
     /// Message-id to the patched files it is an article of.
     articles: HashMap<String, Vec<ArticleRef>>,
-    bytes: u64,
+    data_bytes: u64,
+    meta_bytes: u64,
     spans: usize,
 }
 
 impl Inner {
+    fn bytes(&self) -> u64 {
+        self.data_bytes + self.meta_bytes
+    }
+
     fn index_file(&mut self, release: Uuid, name: &str, articles: &[ArticleSpan]) {
         for a in articles {
             let refs = self.articles.entry(a.message_id.clone()).or_default();
@@ -167,8 +271,18 @@ impl Inner {
         }
     }
 
-    /// Remove a release from the index; returns it so the caller can delete
-    /// its files outside the lock.
+    /// Add a loaded release to the index.
+    fn add_release(&mut self, id: Uuid, release: Release) {
+        for file in release.files.values() {
+            self.index_file(id, &file.name, &file.articles);
+            self.spans += file.spans.len();
+        }
+        self.data_bytes += release.data_bytes;
+        self.meta_bytes += release.meta_bytes;
+        self.releases.insert(id, release);
+    }
+
+    /// Remove a release from the index.
     fn remove_release(&mut self, id: Uuid) -> Option<Release> {
         let release = self.releases.remove(&id)?;
         for file in release.files.values() {
@@ -182,8 +296,40 @@ impl Inner {
             }
             self.spans -= file.spans.len();
         }
-        self.bytes -= release.bytes;
+        self.data_bytes -= release.data_bytes;
+        self.meta_bytes -= release.meta_bytes;
         Some(release)
+    }
+}
+
+/// A span's files written to the incoming directory, waiting to be renamed
+/// into the release.
+#[derive(Debug)]
+struct Staged {
+    stamp: PathBuf,
+    layout: PathBuf,
+    span: PathBuf,
+}
+
+impl Staged {
+    fn discard(&self) {
+        for path in [&self.stamp, &self.layout, &self.span] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// A span's bytes on their way into the index.
+enum Payload {
+    Memory(Arc<[u8]>),
+    Disk(Staged),
+}
+
+impl Payload {
+    fn discard(&self) {
+        if let Payload::Disk(staged) = self {
+            staged.discard();
+        }
     }
 }
 
@@ -217,12 +363,20 @@ impl PatchStore {
         }
     }
 
-    /// Open (or create) a store under `dir`, loading the patches a previous
-    /// process left there. Partial writes are removed, and if the budget
-    /// shrank, the least recently written releases are evicted.
+    /// Open (or create) a store under `dir`, loading the patches, holes and
+    /// verdicts a previous process left there. Partial writes are removed,
+    /// and if the budget shrank, the least recently written releases are
+    /// evicted.
     pub fn open(dir: impl Into<PathBuf>, budget: u64) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        for scratch in [INCOMING_DIR, TRASH_DIR] {
+            match std::fs::remove_dir_all(dir.join(scratch)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        std::fs::create_dir_all(dir.join(INCOMING_DIR))?;
         let store = Self {
             dir: Some(dir.clone()),
             budget,
@@ -254,26 +408,21 @@ impl PatchStore {
         // Oldest first, so the clock orders releases by when they were last
         // written; recency of reads does not survive a restart.
         loaded.sort_by_key(|(t, _, _)| *t);
-        let mut evict = Vec::new();
+        let mut trash = Vec::new();
         {
             let mut inner = store.inner.write();
             for (_, id, release) in loaded {
                 release.last_read.store(store.tick(), Ordering::Relaxed);
-                for file in release.files.values() {
-                    inner.index_file(id, &file.name, &file.articles);
-                    inner.spans += file.spans.len();
-                }
-                inner.bytes += release.bytes;
-                inner.releases.insert(id, release);
+                inner.add_release(id, release);
             }
-            store.evict_to_fit(&mut inner, 0, None, &mut evict);
+            store.evict_to_fit(&mut inner, 0, None, &mut trash);
             info!(
                 releases = inner.releases.len(),
-                bytes = inner.bytes,
+                bytes = inner.bytes(),
                 "patch store loaded"
             );
         }
-        store.delete_files(evict);
+        empty_trash(trash);
         Ok(store)
     }
 
@@ -334,16 +483,7 @@ impl PatchStore {
             let existing = inner.releases.get(&release);
             let stale = existing.is_some_and(|r| r.stamp.nzb_blob_id != stamp.nzb_blob_id);
             let current = existing.filter(|_| !stale);
-            let replaced = current
-                .and_then(|r| r.files.get(&file.name))
-                .map_or(Ok(0), |f| check_overlap(f, offset, len))?;
-            let needed = current.map_or(0, |r| r.bytes) - replaced + len;
-            if needed > self.budget {
-                return Err(PatchError::OverBudget {
-                    needed,
-                    budget: self.budget,
-                });
-            }
+            self.fits(current, file, offset, len)?;
             stale
         };
         if stale {
@@ -351,122 +491,229 @@ impl PatchStore {
             self.drop_release(release);
         }
 
-        let data = match &self.dir {
-            None => SpanData::Memory(bytes.into()),
-            Some(dir) => {
-                let path = self
-                    .write_span(dir, release, stamp, file, offset, &bytes)
-                    .await?;
-                SpanData::Disk(path)
-            }
+        let payload = match &self.dir {
+            None => Payload::Memory(bytes.into()),
+            Some(dir) => Payload::Disk(stage(dir, stamp, file, &bytes).await?),
         };
-
-        let mut evict = Vec::new();
-        let result = {
-            let mut inner = self.inner.write();
-            self.commit(
-                &mut inner,
-                release,
-                stamp,
-                file,
-                offset,
-                Span { len, data },
-                &mut evict,
-            )
-        };
-        self.delete_files(evict);
-        result
+        self.commit(release, stamp, file, offset, len, payload)
     }
 
-    /// Index a written span. Runs under the write lock and re-checks what
-    /// [`insert`](Self::insert) checked, since another insert may have run
-    /// in between.
-    #[allow(clippy::too_many_arguments)]
+    /// Whether a span fits `release` (its current state): no overlap, and
+    /// the release alone within the budget. Returns the growth in bytes.
+    fn fits(
+        &self,
+        release: Option<&Release>,
+        file: &CensusFile,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, PatchError> {
+        let patches = release.and_then(|r| r.files.get(&file.name));
+        let replaced = patches.map_or(Ok(0), |f| check_overlap(f, offset, len))?;
+        let index = if patches.is_some() {
+            0
+        } else {
+            file_cost(&file.name, &file.articles)
+        };
+        let growth = len - replaced + index;
+        let needed = release.map_or(0, Release::bytes) + growth;
+        if needed > self.budget {
+            return Err(PatchError::OverBudget {
+                needed,
+                budget: self.budget,
+            });
+        }
+        Ok(growth)
+    }
+
+    /// Index a span: under the write lock, re-check what
+    /// [`insert`](Self::insert) checked (another insert may have run in
+    /// between), make room, move a staged span into the release, and only
+    /// then index it. A refused span's staged files are removed; they never
+    /// share a path with a live span.
     fn commit(
         &self,
-        inner: &mut Inner,
         release: Uuid,
         stamp: &PatchStamp,
         file: &CensusFile,
         offset: u64,
-        span: Span,
-        evict: &mut Vec<(Uuid, Release)>,
+        len: u64,
+        payload: Payload,
     ) -> Result<(), PatchError> {
-        let len = span.len;
-        let refuse = |e: PatchError, span: &Span| {
-            if let SpanData::Disk(path) = &span.data {
-                let _ = std::fs::remove_file(path);
+        let mut trash = Vec::new();
+        let result = (|| {
+            let mut inner = self.inner.write();
+            let existing = inner.releases.get(&release);
+            if existing.is_some_and(|r| r.stamp.nzb_blob_id != stamp.nzb_blob_id) {
+                return Err(PatchError::Stale);
             }
-            Err(e)
-        };
-        if inner
-            .releases
-            .get(&release)
-            .is_some_and(|r| r.stamp.nzb_blob_id != stamp.nzb_blob_id)
-        {
-            return refuse(PatchError::Stale, &span);
-        }
-        let replaced = match inner
-            .releases
-            .get(&release)
-            .and_then(|r| r.files.get(&file.name))
-            .map_or(Ok(0), |f| check_overlap(f, offset, len))
-        {
-            Ok(r) => r,
-            Err(e) => return refuse(e, &span),
-        };
-        let growth = len - replaced;
-        let own = inner.releases.get(&release).map_or(0, |r| r.bytes) + growth;
-        if own > self.budget {
-            return refuse(
-                PatchError::OverBudget {
-                    needed: own,
-                    budget: self.budget,
-                },
-                &span,
-            );
-        }
-        self.evict_to_fit(inner, growth, Some(release), evict);
+            let growth = self.fits(existing, file, offset, len)?;
+            let new_file = !existing.is_some_and(|r| r.files.contains_key(&file.name));
+            self.evict_to_fit(&mut inner, growth, Some(release), &mut trash);
 
-        let now = self.tick();
-        let entry = inner.releases.entry(release).or_insert_with(|| Release {
-            stamp: stamp.clone(),
-            files: HashMap::new(),
-            bytes: 0,
-            last_read: AtomicU64::new(now),
-        });
-        entry.stamp.server_fingerprint = stamp.server_fingerprint.clone();
-        entry.last_read.store(now, Ordering::Relaxed);
-        let patches = entry
-            .files
-            .entry(file.name.clone())
-            .or_insert_with(|| FilePatches {
-                name: file.name.clone(),
-                articles: file.articles.clone(),
-                size: file_size(file),
-                spans: BTreeMap::new(),
-            });
-        let added = patches.spans.insert(offset, span).is_none();
-        entry.bytes += growth;
-        inner.bytes += growth;
-        if added {
-            inner.spans += 1;
+            let data = match &payload {
+                Payload::Memory(bytes) => SpanData::Memory(Arc::clone(bytes)),
+                Payload::Disk(staged) => {
+                    let dir = self.dir.as_deref().expect("disk payload needs a dir");
+                    SpanData::Disk(place(dir, release, file, offset, len, staged)?)
+                }
+            };
+
+            let now = self.tick();
+            let entry = inner
+                .releases
+                .entry(release)
+                .or_insert_with(|| Release::new(stamp.clone(), now));
+            entry.stamp.server_fingerprint = stamp.server_fingerprint.clone();
+            entry.last_read.store(now, Ordering::Relaxed);
+            let patches = entry
+                .files
+                .entry(file.name.clone())
+                .or_insert_with(|| FilePatches {
+                    name: file.name.clone(),
+                    articles: file.articles.clone(),
+                    size: file_size(file),
+                    spans: BTreeMap::new(),
+                });
+            let replaced = patches.spans.insert(offset, Span { len, data });
+            let data_growth = len - replaced.as_ref().map_or(0, |s| s.len);
+            let meta_growth = growth - data_growth;
+            entry.data_bytes += data_growth;
+            entry.meta_bytes += meta_growth;
+            inner.data_bytes += data_growth;
+            inner.meta_bytes += meta_growth;
+            if replaced.is_none() {
+                inner.spans += 1;
+            }
+            if new_file {
+                inner.index_file(release, &file.name, &file.articles);
+            }
+            debug!(%release, file = %file.name, offset, len, "patch stored");
+            Ok(())
+        })();
+        if result.is_err() {
+            payload.discard();
         }
-        inner.index_file(release, &file.name, &file.articles);
-        debug!(%release, file = %file.name, offset, len, "patch stored");
-        Ok(())
+        empty_trash(trash);
+        result
+    }
+
+    /// Record a release's confirmed holes, so the next process finds them
+    /// ([`stored_holes`](Self::stored_holes)). Provisional holes are skipped;
+    /// a hole already on record for the release is replaced. Returns how
+    /// many were recorded.
+    pub fn record_holes(
+        &self,
+        release: Uuid,
+        stamp: &PatchStamp,
+        holes: &[HoleRecord],
+    ) -> Result<usize, PatchError> {
+        let stored: Vec<StoredHole> = holes.iter().filter_map(StoredHole::from_record).collect();
+        if stored.is_empty() {
+            return Ok(0);
+        }
+        let n = stored.len();
+        self.update_records(release, stamp, |holes, _| {
+            for hole in stored {
+                match holes.iter_mut().find(|h| h.message_id == hole.message_id) {
+                    Some(h) => *h = hole,
+                    None => holes.push(hole),
+                }
+            }
+        })?;
+        Ok(n)
+    }
+
+    /// Record a release's terminal verdict, replacing any earlier one.
+    pub fn record_verdict(
+        &self,
+        release: Uuid,
+        stamp: &PatchStamp,
+        verdict: ReleaseVerdict,
+    ) -> Result<(), PatchError> {
+        self.update_records(release, stamp, |_, v| *v = Some(verdict))
+    }
+
+    /// Change a release's hole records or verdict, write them out, and
+    /// charge them to the budget. Records are small, so they are written
+    /// under the lock.
+    fn update_records(
+        &self,
+        release: Uuid,
+        stamp: &PatchStamp,
+        change: impl FnOnce(&mut Vec<StoredHole>, &mut Option<ReleaseVerdict>),
+    ) -> Result<(), PatchError> {
+        let stale = self
+            .inner
+            .read()
+            .releases
+            .get(&release)
+            .is_some_and(|r| r.stamp.nzb_blob_id != stamp.nzb_blob_id);
+        if stale {
+            info!(%release, "NZB blob changed, dropping the release's patches");
+            self.drop_release(release);
+        }
+        let mut trash = Vec::new();
+        let result = (|| {
+            let mut inner = self.inner.write();
+            let existing = inner.releases.get(&release);
+            if existing.is_some_and(|r| r.stamp.nzb_blob_id != stamp.nzb_blob_id) {
+                return Err(PatchError::Stale);
+            }
+            let mut holes = existing.map(|r| r.holes.clone()).unwrap_or_default();
+            let mut verdict = existing.and_then(|r| r.verdict.clone());
+            change(&mut holes, &mut verdict);
+            let meta = existing.map_or(0, Release::files_cost)
+                + holes.iter().map(hole_cost).sum::<u64>()
+                + verdict.as_ref().map_or(0, verdict_cost);
+            let (old_meta, data) = existing.map_or((0, 0), |r| (r.meta_bytes, r.data_bytes));
+            if data + meta > self.budget {
+                return Err(PatchError::OverBudget {
+                    needed: data + meta,
+                    budget: self.budget,
+                });
+            }
+            self.evict_to_fit(
+                &mut inner,
+                meta.saturating_sub(old_meta),
+                Some(release),
+                &mut trash,
+            );
+            if let Some(dir) = &self.dir {
+                let rel_dir = dir.join(release.to_string());
+                std::fs::create_dir_all(&rel_dir)?;
+                write_json(&rel_dir.join(STAMP_FILE), stamp)?;
+                write_json(&rel_dir.join(HOLES_FILE), &holes)?;
+                match &verdict {
+                    Some(v) => write_json(&rel_dir.join(VERDICT_FILE), v)?,
+                    None => remove_file(&rel_dir.join(VERDICT_FILE))?,
+                }
+            }
+            let now = self.tick();
+            let entry = inner
+                .releases
+                .entry(release)
+                .or_insert_with(|| Release::new(stamp.clone(), now));
+            entry.stamp.server_fingerprint = stamp.server_fingerprint.clone();
+            entry.holes = holes;
+            entry.verdict = verdict;
+            entry.meta_bytes = meta;
+            inner.meta_bytes = inner.meta_bytes - old_meta + meta;
+            Ok(())
+        })();
+        empty_trash(trash);
+        result
     }
 
     /// Evict least recently read releases other than `keep` until `growth`
-    /// more bytes fit the budget.
+    /// more bytes fit the budget. Evicted releases go to the trash.
     fn evict_to_fit(
         &self,
         inner: &mut Inner,
         growth: u64,
         keep: Option<Uuid>,
-        evict: &mut Vec<(Uuid, Release)>,
+        trash: &mut Vec<PathBuf>,
     ) {
-        while inner.bytes + growth > self.budget {
+        while inner.bytes() + growth > self.budget {
             let Some(victim) = inner
                 .releases
                 .iter()
@@ -477,54 +724,30 @@ impl PatchStore {
                 break;
             };
             if let Some(release) = inner.remove_release(victim) {
-                info!(release = %victim, bytes = release.bytes, "patch budget full, evicted release");
-                evict.push((victim, release));
+                info!(release = %victim, bytes = release.bytes(), "patch budget full, evicted release");
+                trash.extend(self.trash_release(victim));
             }
         }
     }
 
-    async fn write_span(
-        &self,
-        dir: &Path,
-        release: Uuid,
-        stamp: &PatchStamp,
-        file: &CensusFile,
-        offset: u64,
-        bytes: &[u8],
-    ) -> io::Result<PathBuf> {
-        let file_dir = dir.join(release.to_string()).join(file_key(&file.name));
-        tokio::fs::create_dir_all(&file_dir).await?;
-        write_atomic(
-            &dir.join(release.to_string()).join(STAMP_FILE),
-            &serde_json::to_vec(stamp)?,
-        )
-        .await?;
-        let layout = Layout {
-            name: file.name.clone(),
-            articles: file
-                .articles
-                .iter()
-                .map(|a| LayoutArticle {
-                    message_id: a.message_id.clone(),
-                    offset: a.offset,
-                    len: a.len,
-                })
-                .collect(),
-        };
-        write_atomic(&file_dir.join(LAYOUT_FILE), &serde_json::to_vec(&layout)?).await?;
-        let path = file_dir.join(format!("{offset}-{}.{SPAN_EXT}", bytes.len()));
-        write_atomic(&path, bytes).await?;
-        Ok(path)
-    }
-
-    fn delete_files(&self, evicted: Vec<(Uuid, Release)>) {
-        let Some(dir) = &self.dir else { return };
-        for (id, _) in evicted {
-            let path = dir.join(id.to_string());
-            if let Err(e) = std::fs::remove_dir_all(&path)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                warn!(release = %id, error = %e, "could not delete patch files");
+    /// Move a release's directory into the trash. Called under the write
+    /// lock, so no span can be placed in it after; the caller removes the
+    /// returned path once the lock is released.
+    fn trash_release(&self, release: Uuid) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        let src = dir.join(release.to_string());
+        let trash = dir.join(TRASH_DIR);
+        let dst = trash.join(format!("{release}-{}", Uuid::new_v4().simple()));
+        let moved = std::fs::create_dir_all(&trash).and_then(|()| std::fs::rename(&src, &dst));
+        match moved {
+            Ok(()) => Some(dst),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!(%release, error = %e, "could not trash patch files, deleting in place");
+                if let Err(e) = std::fs::remove_dir_all(&src) {
+                    warn!(%release, error = %e, "could not delete patch files");
+                }
+                None
             }
         }
     }
@@ -575,17 +798,16 @@ impl PatchStore {
         })
     }
 
-    /// Drop every patch of a release: its history entry was deleted, or its
-    /// NZB was replaced.
+    /// Drop every patch, hole record and verdict of a release: its item or
+    /// history entry was deleted, or its NZB was replaced.
     pub fn drop_release(&self, release: Uuid) -> bool {
-        let removed = self.inner.write().remove_release(release);
-        let found = removed.is_some();
-        if let Some(r) = removed {
-            self.delete_files(vec![(release, r)]);
-        } else if let Some(dir) = &self.dir {
-            // Nothing indexed, but clear anything a failed write left.
-            let _ = std::fs::remove_dir_all(dir.join(release.to_string()));
-        }
+        let (found, trash) = {
+            let mut inner = self.inner.write();
+            let found = inner.remove_release(release).is_some();
+            // Even with nothing indexed, clear anything a failed write left.
+            (found, self.trash_release(release))
+        };
+        empty_trash(trash.into_iter().collect());
         found
     }
 
@@ -609,7 +831,7 @@ impl PatchStore {
         }
     }
 
-    /// Releases with patches.
+    /// Releases with patches, hole records or a verdict.
     pub fn releases(&self) -> Vec<Uuid> {
         self.inner.read().releases.keys().copied().collect()
     }
@@ -623,17 +845,49 @@ impl PatchStore {
             .map(|r| r.stamp.clone())
     }
 
+    /// A release's recorded confirmed holes.
+    pub fn holes(&self, release: Uuid) -> Vec<StoredHole> {
+        self.inner
+            .read()
+            .releases
+            .get(&release)
+            .map(|r| r.holes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every recorded confirmed hole, for a new process's hole ledger
+    /// ([`crate::HoleLedger::restore`]).
+    pub fn stored_holes(&self) -> Vec<StoredHole> {
+        self.inner
+            .read()
+            .releases
+            .values()
+            .flat_map(|r| r.holes.iter().cloned())
+            .collect()
+    }
+
+    /// A release's terminal verdict.
+    pub fn verdict(&self, release: Uuid) -> Option<ReleaseVerdict> {
+        self.inner
+            .read()
+            .releases
+            .get(&release)
+            .and_then(|r| r.verdict.clone())
+    }
+
     /// Totals for the status surface.
     pub fn totals(&self) -> PatchTotals {
         let inner = self.inner.read();
         let (memory_bytes, disk_bytes) = if self.dir.is_some() {
-            (0, inner.bytes)
+            (inner.meta_bytes, inner.data_bytes)
         } else {
-            (inner.bytes, 0)
+            (inner.bytes(), 0)
         };
         PatchTotals {
             releases: inner.releases.len(),
             spans: inner.spans,
+            patch_bytes: inner.data_bytes,
+            index_bytes: inner.meta_bytes,
             memory_bytes,
             disk_bytes,
             budget_bytes: self.budget,
@@ -700,6 +954,30 @@ fn file_size(file: &CensusFile) -> u64 {
         .unwrap_or(0)
 }
 
+/// Budget a patched file's layout and article index take.
+fn file_cost(name: &str, articles: &[ArticleSpan]) -> u64 {
+    let name = name.len() as u64;
+    FILE_INDEX_COST
+        + name
+        + articles
+            .iter()
+            .map(|a| ARTICLE_INDEX_COST + 2 * a.message_id.len() as u64 + name)
+            .sum::<u64>()
+}
+
+fn hole_cost(hole: &StoredHole) -> u64 {
+    RECORD_COST
+        + (hole.message_id.len()
+            + hole.server_fingerprint.len()
+            + hole.refused_by.iter().map(String::len).sum::<usize>()
+            + hole.unreachable.iter().map(String::len).sum::<usize>()) as u64
+}
+
+fn verdict_cost(verdict: &ReleaseVerdict) -> u64 {
+    RECORD_COST
+        + (verdict.diagnosis.len() + verdict.servers.iter().map(String::len).sum::<usize>()) as u64
+}
+
 fn file_key(name: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
 }
@@ -717,14 +995,95 @@ struct LayoutArticle {
     len: u64,
 }
 
-async fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Write a span's stamp, layout and bytes to the incoming directory.
+async fn stage(
+    dir: &Path,
+    stamp: &PatchStamp,
+    file: &CensusFile,
+    bytes: &[u8],
+) -> io::Result<Staged> {
+    let incoming = dir.join(INCOMING_DIR);
+    tokio::fs::create_dir_all(&incoming).await?;
+    let layout = Layout {
+        name: file.name.clone(),
+        articles: file
+            .articles
+            .iter()
+            .map(|a| LayoutArticle {
+                message_id: a.message_id.clone(),
+                offset: a.offset,
+                len: a.len,
+            })
+            .collect(),
+    };
+    let stamp = serde_json::to_vec(stamp)?;
+    let layout = serde_json::to_vec(&layout)?;
+    let mut written = Vec::with_capacity(3);
+    for body in [&stamp[..], &layout[..], bytes] {
+        let path = incoming.join(format!("{}.{TMP_EXT}", Uuid::new_v4().simple()));
+        if let Err(e) = tokio::fs::write(&path, body).await {
+            let _ = tokio::fs::remove_file(&path).await;
+            for p in &written {
+                let _ = tokio::fs::remove_file(p).await;
+            }
+            return Err(e);
+        }
+        written.push(path);
+    }
+    let [stamp, layout, span]: [PathBuf; 3] = written.try_into().expect("three files staged");
+    Ok(Staged {
+        stamp,
+        layout,
+        span,
+    })
+}
+
+/// Rename a staged span into its release, creating the release's
+/// directory, stamp and layout as needed. Runs under the write lock.
+fn place(
+    dir: &Path,
+    release: Uuid,
+    file: &CensusFile,
+    offset: u64,
+    len: u64,
+    staged: &Staged,
+) -> io::Result<PathBuf> {
+    let rel_dir = dir.join(release.to_string());
+    let file_dir = rel_dir.join(file_key(&file.name));
+    std::fs::create_dir_all(&file_dir)?;
+    std::fs::rename(&staged.stamp, rel_dir.join(STAMP_FILE))?;
+    std::fs::rename(&staged.layout, file_dir.join(LAYOUT_FILE))?;
+    let path = file_dir.join(format!("{offset}-{len}.{SPAN_EXT}"));
+    std::fs::rename(&staged.span, &path)?;
+    Ok(path)
+}
+
+/// Write `value` as JSON through a temporary file and a rename.
+fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let tmp = path.with_extension(format!("{}.{TMP_EXT}", Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, bytes).await?;
-    if let Err(e) = tokio::fs::rename(&tmp, path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
+    std::fs::write(&tmp, serde_json::to_vec(value)?)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+fn remove_file(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+fn empty_trash(trash: Vec<PathBuf>) {
+    for path in trash {
+        if let Err(e) = std::fs::remove_dir_all(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), error = %e, "could not delete patch files");
+        }
+    }
 }
 
 async fn read_range(path: &Path, start: u64, n: u64) -> io::Result<Vec<u8>> {
@@ -735,30 +1094,46 @@ async fn read_range(path: &Path, start: u64, n: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Load one release directory: its stamp, file layouts and complete spans,
-/// with the newest span's write time. `None` when nothing usable is left.
+/// Read an optional JSON file of a release, with its write time.
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<(T, SystemTime)>> {
+    match std::fs::read(path) {
+        Ok(b) => {
+            let at = std::fs::metadata(path)?
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            Ok(Some((serde_json::from_slice(&b)?, at)))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Load one release directory: its stamp, hole records, verdict, file
+/// layouts and complete spans, with the newest write time. `None` when
+/// nothing usable is left.
 fn load_release(path: &Path) -> io::Result<Option<(SystemTime, Release)>> {
-    let stamp: PatchStamp = match std::fs::read(path.join(STAMP_FILE)) {
-        Ok(b) => serde_json::from_slice(&b)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+    let Some((stamp, _)) = read_json::<PatchStamp>(&path.join(STAMP_FILE))? else {
+        return Ok(None);
     };
-    let mut files = HashMap::new();
-    let mut bytes = 0u64;
+    let mut release = Release::new(stamp, 0);
     let mut newest = SystemTime::UNIX_EPOCH;
+    if let Some((holes, at)) = read_json::<Vec<StoredHole>>(&path.join(HOLES_FILE))? {
+        release.holes = holes;
+        newest = newest.max(at);
+    }
+    if let Some((verdict, at)) = read_json::<ReleaseVerdict>(&path.join(VERDICT_FILE))? {
+        release.verdict = Some(verdict);
+        newest = newest.max(at);
+    }
     for entry in std::fs::read_dir(path)? {
         let file_dir = entry?.path();
         if !file_dir.is_dir() {
             remove_if_tmp(&file_dir);
             continue;
         }
-        let layout: Layout = match std::fs::read(file_dir.join(LAYOUT_FILE)) {
-            Ok(b) => serde_json::from_slice(&b)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let _ = std::fs::remove_dir_all(&file_dir);
-                continue;
-            }
-            Err(e) => return Err(e),
+        let Some((layout, _)) = read_json::<Layout>(&file_dir.join(LAYOUT_FILE))? else {
+            let _ = std::fs::remove_dir_all(&file_dir);
+            continue;
         };
         let articles: Vec<ArticleSpan> = layout
             .articles
@@ -811,7 +1186,7 @@ fn load_release(path: &Path) -> io::Result<Option<(SystemTime, Release)>> {
             if let Ok(t) = meta.modified() {
                 newest = newest.max(t);
             }
-            bytes += len;
+            release.data_bytes += len;
             patches.spans.insert(
                 offset,
                 Span {
@@ -820,22 +1195,19 @@ fn load_release(path: &Path) -> io::Result<Option<(SystemTime, Release)>> {
                 },
             );
         }
-        if !patches.spans.is_empty() {
-            files.insert(patches.name.clone(), patches);
+        if patches.spans.is_empty() {
+            let _ = std::fs::remove_dir_all(&file_dir);
+        } else {
+            release.files.insert(patches.name.clone(), patches);
         }
     }
-    if files.is_empty() {
+    if release.is_empty() {
         return Ok(None);
     }
-    Ok(Some((
-        newest,
-        Release {
-            stamp,
-            files,
-            bytes,
-            last_read: AtomicU64::new(0),
-        },
-    )))
+    release.meta_bytes = release.files_cost()
+        + release.holes.iter().map(hole_cost).sum::<u64>()
+        + release.verdict.as_ref().map_or(0, verdict_cost);
+    Ok(Some((newest, release)))
 }
 
 fn remove_if_tmp(path: &Path) -> bool {
@@ -948,7 +1320,9 @@ mod tests {
             .unwrap();
         assert_eq!(store.read_article("a1").await.unwrap(), vec![7; 100]);
         let totals = store.totals();
-        assert_eq!((totals.spans, totals.memory_bytes), (2, 200));
+        assert_eq!((totals.spans, totals.patch_bytes), (2, 200));
+        assert_eq!(totals.index_bytes, file_cost(&f.name, &f.articles));
+        assert_eq!(totals.memory_bytes, 200 + totals.index_bytes);
         // Past the end of the file.
         let err = store
             .insert(release(1), &stamp(1), &f, 350, vec![0; 100])
@@ -959,8 +1333,10 @@ mod tests {
 
     #[tokio::test]
     async fn budget_evicts_least_recently_read_release_whole() {
-        let store = PatchStore::in_memory(400);
         let fa = file("a.rar", "a", 4, 100);
+        // Room for 400 span bytes and the index of two files.
+        let index = file_cost(&fa.name, &fa.articles);
+        let store = PatchStore::in_memory(400 + 2 * index);
         let fb = file("b.rar", "b", 4, 100);
         let fc = file("c.rar", "c", 4, 100);
         // Release 1 has two spans, release 2 one.
@@ -998,16 +1374,17 @@ mod tests {
         assert!(store.read_article("a0").await.is_none());
         assert!(store.read_article("a2").await.is_none());
         assert_eq!(store.releases(), vec![release(3)]);
-        assert_eq!(store.totals().memory_bytes, 400);
+        assert_eq!(store.totals().patch_bytes, 400);
+        assert_eq!(store.totals().index_bytes, index);
 
         // A release that cannot fit alone is refused, and nothing is evicted.
         let err = store
             .insert(
                 release(4),
                 &stamp(4),
-                &file("d.rar", "d", 8, 100),
+                &file("d.rar", "d", 16, 100),
                 0,
-                vec![4; 500],
+                vec![4; 1000],
             )
             .await
             .unwrap_err();
@@ -1056,6 +1433,7 @@ mod tests {
                 .unwrap();
             assert_eq!(store.totals().disk_bytes, 100);
         }
+        let index = file_cost(&f.name, &f.articles);
         // A partial write left by a crash is cleaned up on open.
         let rel_dir = dir.path().join(release(1).to_string());
         let file_dir = rel_dir.join(file_key(&f.name));
@@ -1070,6 +1448,10 @@ mod tests {
             (totals.releases, totals.spans, totals.disk_bytes),
             (1, 1, 100)
         );
+        assert_eq!(
+            totals.memory_bytes, index,
+            "the index is reloaded and counted"
+        );
 
         // Deleting the release removes its files.
         assert!(store.drop_release(release(1)));
@@ -1083,15 +1465,11 @@ mod tests {
     #[tokio::test]
     async fn disk_eviction_deletes_files_and_reopen_honours_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PatchStore::open(dir.path(), 300).unwrap();
+        let fa = file("a", "a", 2, 100);
+        let index = file_cost(&fa.name, &fa.articles);
+        let store = PatchStore::open(dir.path(), 300 + index).unwrap();
         store
-            .insert(
-                release(1),
-                &stamp(1),
-                &file("a", "a", 2, 100),
-                0,
-                vec![1; 200],
-            )
+            .insert(release(1), &stamp(1), &fa, 0, vec![1; 200])
             .await
             .unwrap();
         store
@@ -1109,7 +1487,7 @@ mod tests {
         drop(store);
 
         // A smaller budget on reopen evicts.
-        let store = PatchStore::open(dir.path(), 100).unwrap();
+        let store = PatchStore::open(dir.path(), 100 + index).unwrap();
         assert!(store.releases().is_empty());
         assert!(!dir.path().join(release(2).to_string()).exists());
     }
@@ -1131,7 +1509,7 @@ mod tests {
     /// Readers racing a writer that keeps replacing a span (and adding and
     /// evicting others) always see one whole version of the article.
     async fn no_tearing(store: Arc<PatchStore>) {
-        let f = file("a.rar", "a", 64, 4096);
+        let f = file(NO_TEARING_A, "a", 64, 4096);
         store
             .insert(release(1), &stamp(1), &f, 0, vec![0; 8192])
             .await
@@ -1147,7 +1525,7 @@ mod tests {
                         .await
                         .unwrap();
                     // Churn another release through the budget.
-                    let other = file("b.rar", "b", 4, 4096);
+                    let other = file(NO_TEARING_B, "b", 4, 4096);
                     let _ = store
                         .insert(
                             release(2 + u128::from(round)),
@@ -1185,15 +1563,215 @@ mod tests {
         }
     }
 
+    const NO_TEARING_A: &str = "a.rar";
+    const NO_TEARING_B: &str = "b.rar";
+
+    /// Room for release 1 and one other release.
+    fn no_tearing_budget() -> u64 {
+        let a = file(NO_TEARING_A, "a", 64, 4096);
+        let b = file(NO_TEARING_B, "b", 4, 4096);
+        8192 + 4096 + file_cost(&a.name, &a.articles) + file_cost(&b.name, &b.articles)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reads_and_writes_in_memory() {
-        // Room for release 1 and one other release.
-        no_tearing(Arc::new(PatchStore::in_memory(8192 + 4096))).await;
+        no_tearing(Arc::new(PatchStore::in_memory(no_tearing_budget()))).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reads_and_writes_on_disk() {
         let dir = tempfile::tempdir().unwrap();
-        no_tearing(Arc::new(PatchStore::open(dir.path(), 8192 + 4096).unwrap())).await;
+        let store = PatchStore::open(dir.path(), no_tearing_budget()).unwrap();
+        no_tearing(Arc::new(store)).await;
+    }
+
+    fn confirmed_hole(message_id: &str) -> HoleRecord {
+        let now = tokio::time::Instant::now();
+        HoleRecord {
+            message_id: message_id.into(),
+            state: crate::holes::HoleState::Confirmed,
+            refused_by: vec!["fake-0".into()],
+            unreachable: vec![],
+            first_refused_at: now,
+            confirmed_at: Some(now),
+            expires_at: Some(now + crate::holes::HOLE_TTL),
+            server_fingerprint: "fake-0".into(),
+        }
+    }
+
+    /// Hole records and the terminal verdict outlive the process, with or
+    /// without patches, count against the budget, and go with the release.
+    #[tokio::test]
+    async fn holes_and_verdict_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = file("a.rar", "a", 4, 100);
+        let servers = vec!["fake-0".to_string()];
+        {
+            let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+            // Release 1: a patch and its hole. Release 2: hopeless, no patch.
+            store
+                .insert(release(1), &stamp(1), &f, 100, vec![5; 100])
+                .await
+                .unwrap();
+            let mut provisional = confirmed_hole("a3");
+            provisional.state = crate::holes::HoleState::Provisional;
+            let recorded = store
+                .record_holes(release(1), &stamp(1), &[confirmed_hole("a1"), provisional])
+                .unwrap();
+            assert_eq!(recorded, 1, "provisional holes are not kept");
+            // Recording the same hole again replaces it.
+            store
+                .record_holes(release(1), &stamp(1), &[confirmed_hole("a1")])
+                .unwrap();
+            store
+                .record_holes(release(2), &stamp(2), &[confirmed_hole("b0")])
+                .unwrap();
+            store
+                .record_verdict(
+                    release(2),
+                    &stamp(2),
+                    ReleaseVerdict::new("beyond_repair: 3 slices lost, 1 block", &servers),
+                )
+                .unwrap();
+        }
+
+        let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+        let mut releases = store.releases();
+        releases.sort();
+        assert_eq!(releases, vec![release(1), release(2)]);
+        let holes = store.holes(release(1));
+        assert_eq!(holes.len(), 1);
+        assert_eq!(holes[0].message_id, "a1");
+        assert!(!holes[0].expired());
+        assert_eq!(store.read_article("a1").await.unwrap(), vec![5; 100]);
+        let verdict = store.verdict(release(2)).unwrap();
+        assert!(verdict.diagnosis.starts_with("beyond_repair"));
+        assert!(verdict.applies_to(&servers));
+        assert!(!verdict.applies_to(&["fake-0".into(), "fake-1".into()]));
+        assert_eq!(store.verdict(release(1)), None);
+        let mut ids: Vec<String> = store
+            .stored_holes()
+            .into_iter()
+            .map(|h| h.message_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a1", "b0"]);
+
+        let totals = store.totals();
+        let records = 2 * hole_cost(&holes[0]) + verdict_cost(&verdict);
+        assert_eq!(
+            totals.index_bytes,
+            file_cost(&f.name, &f.articles) + records
+        );
+
+        // A new NZB blob drops the release's holes with its patches.
+        store
+            .record_holes(release(1), &stamp(9), &[confirmed_hole("a2")])
+            .unwrap();
+        assert_eq!(store.holes(release(1))[0].message_id, "a2");
+        assert!(store.read_article("a1").await.is_none());
+
+        // Dropping a release drops its records, on disk too.
+        assert!(store.drop_release(release(2)));
+        assert_eq!(store.verdict(release(2)), None);
+        drop(store);
+        let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(store.releases(), vec![release(1)]);
+        assert!(store.holes(release(2)).is_empty());
+    }
+
+    /// A span of a few bytes still pays for its file's article index: a
+    /// file with many articles cannot hide in the budget.
+    #[tokio::test]
+    async fn article_index_counts_against_the_budget() {
+        let f = file("big.rar", "article-with-a-long-message-id-", 10_000, 100);
+        let index = file_cost(&f.name, &f.articles);
+        assert!(index > 1_000_000, "{index}");
+        let store = PatchStore::in_memory(1 << 20);
+        let err = store
+            .insert(release(1), &stamp(1), &f, 0, vec![1; 10])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PatchError::OverBudget { .. }), "{err}");
+
+        // A second span of a file already indexed pays only its bytes, and
+        // a file's index makes room by evicting others.
+        let small = file("s.rar", "s", 4, 100);
+        let small_index = file_cost(&small.name, &small.articles);
+        let store = PatchStore::in_memory(200 + small_index + 50);
+        store
+            .insert(release(1), &stamp(1), &small, 0, vec![1; 100])
+            .await
+            .unwrap();
+        store
+            .insert(release(1), &stamp(1), &small, 100, vec![1; 100])
+            .await
+            .unwrap();
+        assert_eq!(store.totals().index_bytes, small_index);
+        let other = file("t.rar", "t", 4, 100);
+        store
+            .insert(release(2), &stamp(2), &other, 0, vec![2; 10])
+            .await
+            .unwrap();
+        assert_eq!(store.releases(), vec![release(2)]);
+        assert_eq!(store.totals().patch_bytes, 10);
+    }
+
+    /// A span refused at commit (here: the release went to another NZB blob
+    /// between the check and the commit) removes only its staged files, not
+    /// the live span at the same range, and its bytes are never counted.
+    #[tokio::test]
+    async fn refused_commit_keeps_the_live_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+        let f = file("a.rar", "a", 4, 100);
+        store
+            .insert(release(1), &stamp(1), &f, 100, vec![1; 100])
+            .await
+            .unwrap();
+        let staged = stage(dir.path(), &stamp(2), &f, &[2; 100]).await.unwrap();
+        let err = store
+            .commit(release(1), &stamp(2), &f, 100, 100, Payload::Disk(staged))
+            .unwrap_err();
+        assert!(matches!(err, PatchError::Stale), "{err}");
+        assert_eq!(store.read_article("a1").await.unwrap(), vec![1; 100]);
+        assert_eq!(store.totals().disk_bytes, 100);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(INCOMING_DIR))
+                .unwrap()
+                .count(),
+            0,
+            "staged files removed"
+        );
+        drop(store);
+        let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(store.read_article("a1").await.unwrap(), vec![1; 100]);
+    }
+
+    /// A release dropped while a span of it is being written: the commit
+    /// recreates the release whole (stamp, layout and span), so what is
+    /// counted is on disk and survives a restart.
+    #[tokio::test]
+    async fn drop_between_write_and_commit_leaves_a_whole_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+        let f = file("a.rar", "a", 4, 100);
+        store
+            .insert(release(1), &stamp(1), &f, 0, vec![1; 100])
+            .await
+            .unwrap();
+        let staged = stage(dir.path(), &stamp(1), &f, &[2; 100]).await.unwrap();
+        assert!(store.drop_release(release(1)));
+        store
+            .commit(release(1), &stamp(1), &f, 100, 100, Payload::Disk(staged))
+            .unwrap();
+        let totals = store.totals();
+        assert_eq!((totals.spans, totals.disk_bytes), (1, 100));
+        assert!(store.read_article("a0").await.is_none());
+        assert_eq!(store.read_article("a1").await.unwrap(), vec![2; 100]);
+        drop(store);
+        let store = PatchStore::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(store.read_article("a1").await.unwrap(), vec![2; 100]);
+        assert_eq!(store.totals().disk_bytes, 100);
     }
 }

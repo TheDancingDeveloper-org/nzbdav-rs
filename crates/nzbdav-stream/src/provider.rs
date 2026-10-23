@@ -131,13 +131,32 @@ impl UsenetArticleProvider {
     /// one, so the census and the repair job see the same holes.
     pub fn with_ledger(mut self, ledger: Arc<dyn HoleLedger>) -> Self {
         self.ledger = ledger;
+        self.restore_holes();
         self
     }
 
-    /// Serve repaired spans from `patches` in place of confirmed holes.
+    /// Serve repaired spans from `patches` in place of confirmed holes, and
+    /// take back the confirmed holes recorded with them, so a hole a previous
+    /// process confirmed is not asked of the servers again.
     pub fn with_patches(mut self, patches: Arc<PatchStore>) -> Self {
         self.patches = Some(patches);
+        self.restore_holes();
         self
+    }
+
+    fn restore_holes(&self) {
+        let Some(patches) = &self.patches else { return };
+        let holes = patches.stored_holes();
+        if holes.is_empty() {
+            return;
+        }
+        for hole in &holes {
+            self.ledger.restore(hole);
+        }
+        debug!(
+            holes = holes.len(),
+            "restored recorded holes into the ledger"
+        );
     }
 
     /// The patch store, if one is attached.
