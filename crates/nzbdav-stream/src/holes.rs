@@ -16,6 +16,9 @@
 //!   re-probes while the others keep the fast answer.
 //! - Every record is keyed to the set of servers that were asked
 //!   ([`server_fingerprint`]); adding or removing a server invalidates it.
+//! - The ledger is bounded: a provisional hole nobody confirms lapses after
+//!   the confirm deadline plus a margin, a confirmed hole long past its TTL is
+//!   swept, and past a capacity the least recently used records are evicted.
 //!
 //! Callers translate their own failures into an [`Outcome`] before calling
 //! [`HoleLedger::note`]: a body is [`Outcome::Present`], a `430` is
@@ -26,6 +29,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::time::Instant;
+use tracing::debug;
 
 /// How long a confirmed hole is believed before a re-probe (zurg `holeTTL`).
 pub const HOLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -37,6 +41,17 @@ pub const HOLE_CONFIRM_FETCH: Duration = Duration::from_secs(5);
 /// A re-probe claim older than this is abandoned and another caller may
 /// re-probe.
 const REPROBE_CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Slack on top of the confirm delay and deadline before an unconfirmed
+/// provisional hole lapses.
+const PROVISIONAL_MARGIN: Duration = Duration::from_secs(60);
+/// How long a confirmed hole is kept past its TTL, so the readers that hit it
+/// keep the fast answer while one of them re-probes. After that it is swept.
+const EXPIRED_GRACE: Duration = Duration::from_secs(60 * 60);
+/// Least often the ledger sweeps lapsed records when it inserts one.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Records the in-memory ledger holds before evicting the least recently
+/// used.
+pub const DEFAULT_HOLE_CAPACITY: usize = 100_000;
 
 /// State of a hole in the ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,11 +146,24 @@ struct Entry {
     expires_at: Option<Instant>,
     fingerprint: String,
     reprobe_claimed_at: Option<Instant>,
+    /// Use counter value at the last note or consult, for LRU eviction.
+    touched: u64,
 }
 
 impl Entry {
     fn expired(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|exp| now >= exp)
+    }
+
+    /// No longer evidence of anything: an unconfirmed provisional hole past
+    /// `provisional_ttl`, or a confirmed hole past its TTL plus the grace.
+    fn lapsed(&self, now: Instant, provisional_ttl: Duration) -> bool {
+        match self.state {
+            HoleState::Provisional => now.duration_since(self.first_refused_at) >= provisional_ttl,
+            HoleState::Confirmed => self
+                .expires_at
+                .is_some_and(|exp| now >= exp + EXPIRED_GRACE),
+        }
     }
 
     fn servers_with(&self, kind: Evidence) -> Vec<String> {
@@ -151,13 +179,30 @@ impl Entry {
 }
 
 /// In-memory ledger. Only holes are held: a present answer drops the record,
-/// so memory grows with damage, not with traffic. Holes live until their TTL
-/// runs out and a re-probe settles them; nothing survives a restart until a
-/// persisted ledger (nzb-core, WI-167) replaces this one.
+/// so memory grows with damage, not with traffic, and is bounded: lapsed
+/// records are swept when new ones go in, and past the capacity the least
+/// recently used are evicted. Nothing survives a restart until a persisted
+/// ledger (nzb-core, WI-167) replaces this one.
 pub struct InMemoryHoleLedger {
     confirm_after: Duration,
     ttl: Duration,
-    holes: Mutex<HashMap<String, Entry>>,
+    provisional_ttl: Duration,
+    capacity: usize,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    holes: HashMap<String, Entry>,
+    /// Use counter; orders records for LRU eviction.
+    clock: u64,
+    next_sweep: Option<Instant>,
+}
+
+impl Inner {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
 }
 
 impl Default for InMemoryHoleLedger {
@@ -174,7 +219,13 @@ impl InMemoryHoleLedger {
         Self {
             confirm_after,
             ttl: HOLE_TTL,
-            holes: Mutex::new(HashMap::new()),
+            provisional_ttl: confirm_after + HOLE_CONFIRM_FETCH + PROVISIONAL_MARGIN,
+            capacity: DEFAULT_HOLE_CAPACITY,
+            inner: Mutex::new(Inner {
+                holes: HashMap::new(),
+                clock: 0,
+                next_sweep: None,
+            }),
         }
     }
 
@@ -183,23 +234,85 @@ impl InMemoryHoleLedger {
         self.ttl = ttl;
         self
     }
+
+    /// How long a provisional hole waits for its confirm before it lapses.
+    pub fn with_provisional_ttl(mut self, ttl: Duration) -> Self {
+        self.provisional_ttl = ttl;
+        self
+    }
+
+    /// Records held before the least recently used are evicted (at least 1).
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity.max(1);
+        self
+    }
+
+    /// Records held, lapsed ones included until the next sweep.
+    pub fn len(&self) -> usize {
+        self.inner.lock().holes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn sweep(&self, inner: &mut Inner, now: Instant) {
+        inner
+            .holes
+            .retain(|_, e| !e.lapsed(now, self.provisional_ttl));
+        inner.next_sweep = Some(now + SWEEP_INTERVAL);
+    }
+
+    /// Make room for one new record: sweep lapsed records when due or when
+    /// full, then evict the least recently used down to 90% of capacity.
+    fn make_room(&self, inner: &mut Inner, now: Instant) {
+        let full = inner.holes.len() >= self.capacity;
+        if full || inner.next_sweep.is_none_or(|at| now >= at) {
+            self.sweep(inner, now);
+        }
+        if inner.holes.len() < self.capacity {
+            return;
+        }
+        let keep = (self.capacity * 9 / 10).min(self.capacity - 1);
+        let mut by_use: Vec<(u64, String)> = inner
+            .holes
+            .iter()
+            .map(|(id, e)| (e.touched, id.clone()))
+            .collect();
+        by_use.sort_unstable();
+        let evict = inner.holes.len() - keep;
+        for (_, id) in by_use.into_iter().take(evict) {
+            inner.holes.remove(&id);
+        }
+        debug!(
+            evicted = evict,
+            capacity = self.capacity,
+            "hole ledger full, evicted least recently used"
+        );
+    }
 }
 
 impl HoleLedger for InMemoryHoleLedger {
     fn note(&self, message_id: &str, outcome: &Outcome, servers: &[String]) -> Noted {
         let now = Instant::now();
         let fingerprint = server_fingerprint(servers);
-        let mut holes = self.holes.lock();
+        let mut inner = self.inner.lock();
+        let touched = inner.tick();
 
-        // A record keyed to another server set, or a confirmed hole past its
-        // TTL, is no evidence any more: the outcome starts it over.
-        if holes
-            .get(message_id)
-            .is_some_and(|e| e.fingerprint != fingerprint || e.expired(now))
-            && !matches!(outcome, Outcome::Transport { .. })
-        {
-            holes.remove(message_id);
+        // A lapsed record is gone whatever the outcome. One keyed to another
+        // server set, or a confirmed hole past its TTL, is no evidence any
+        // more: a conclusive outcome starts it over.
+        if inner.holes.get(message_id).is_some_and(|e| {
+            e.lapsed(now, self.provisional_ttl)
+                || (!matches!(outcome, Outcome::Transport { .. })
+                    && (e.fingerprint != fingerprint || e.expired(now)))
+        }) {
+            inner.holes.remove(message_id);
         }
+        if matches!(outcome, Outcome::Refused { .. }) && !inner.holes.contains_key(message_id) {
+            self.make_room(&mut inner, now);
+        }
+        let holes = &mut inner.holes;
 
         match outcome {
             Outcome::Present => {
@@ -219,6 +332,7 @@ impl HoleLedger for InMemoryHoleLedger {
                         confirm_needed: false,
                     };
                 };
+                entry.touched = touched;
                 entry.evidence.insert(server.clone(), Evidence::Transport);
                 entry.reprobe_claimed_at = None;
                 Noted {
@@ -237,7 +351,9 @@ impl HoleLedger for InMemoryHoleLedger {
                         expires_at: None,
                         fingerprint,
                         reprobe_claimed_at: None,
+                        touched,
                     });
+                entry.touched = touched;
                 entry.evidence.insert(server.clone(), Evidence::Refused);
                 if entry.state == HoleState::Confirmed {
                     return Noted {
@@ -267,14 +383,19 @@ impl HoleLedger for InMemoryHoleLedger {
 
     fn consult(&self, message_id: &str, servers: &[String]) -> Consult {
         let now = Instant::now();
-        let mut holes = self.holes.lock();
+        let mut inner = self.inner.lock();
+        let touched = inner.tick();
+        let holes = &mut inner.holes;
         let Some(entry) = holes.get_mut(message_id) else {
             return Consult::Fetch;
         };
-        if entry.fingerprint != server_fingerprint(servers) {
+        if entry.fingerprint != server_fingerprint(servers)
+            || entry.lapsed(now, self.provisional_ttl)
+        {
             holes.remove(message_id);
             return Consult::Fetch;
         }
+        entry.touched = touched;
         match entry.state {
             HoleState::Provisional => Consult::Provisional,
             HoleState::Confirmed if !entry.expired(now) => Consult::Skip,
@@ -293,12 +414,20 @@ impl HoleLedger for InMemoryHoleLedger {
     }
 
     fn state(&self, message_id: &str) -> Option<HoleState> {
-        self.holes.lock().get(message_id).map(|e| e.state)
+        let now = Instant::now();
+        self.inner
+            .lock()
+            .holes
+            .get(message_id)
+            .filter(|e| !e.lapsed(now, self.provisional_ttl))
+            .map(|e| e.state)
     }
 
     fn holes(&self) -> Vec<HoleRecord> {
-        let holes = self.holes.lock();
-        let mut out: Vec<HoleRecord> = holes
+        let mut inner = self.inner.lock();
+        self.sweep(&mut inner, Instant::now());
+        let mut out: Vec<HoleRecord> = inner
+            .holes
             .iter()
             .map(|(id, e)| HoleRecord {
                 message_id: id.clone(),
@@ -441,6 +570,88 @@ mod tests {
         assert_eq!(ledger.consult("x", &servers(&["a"])), Consult::Skip);
         assert_eq!(ledger.consult("x", &servers(&["a", "b"])), Consult::Fetch);
         assert_eq!(ledger.state("x"), None);
+    }
+
+    /// A provisional hole nobody confirms lapses after the confirm deadline
+    /// plus the margin, and a later refusal starts a fresh one.
+    #[tokio::test(start_paused = true)]
+    async fn unconfirmed_provisional_hole_lapses() {
+        let ledger = InMemoryHoleLedger::default();
+        let s = servers(&["a", "b"]);
+        ledger.note("x", &refused("a"), &s);
+        let lapse = HOLE_CONFIRM_DELAY + HOLE_CONFIRM_FETCH + PROVISIONAL_MARGIN;
+        tokio::time::advance(lapse - Duration::from_millis(1)).await;
+        assert_eq!(ledger.state("x"), Some(HoleState::Provisional));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(ledger.state("x"), None);
+        assert!(ledger.holes().is_empty());
+        assert!(ledger.is_empty(), "swept");
+
+        // The stale refusal from "a" does not count towards a confirm.
+        ledger.note("y", &refused("a"), &s);
+        tokio::time::advance(lapse).await;
+        ledger.note("y", &refused("b"), &s);
+        assert_eq!(ledger.state("y"), Some(HoleState::Provisional));
+        assert_eq!(ledger.holes()[0].refused_by, vec!["b".to_string()]);
+        assert_eq!(ledger.consult("x", &s), Consult::Fetch);
+    }
+
+    /// Confirmed holes long past their TTL are swept when a new record goes
+    /// in, without anyone consulting them again.
+    #[tokio::test(start_paused = true)]
+    async fn expired_confirmed_holes_are_swept_on_insert() {
+        let ledger = InMemoryHoleLedger::new(Duration::ZERO);
+        let s = servers(&["a"]);
+        for id in ["x", "y", "z"] {
+            ledger.note(id, &refused("a"), &s);
+        }
+        assert_eq!(ledger.len(), 3);
+
+        // Past the TTL but within the grace: kept, so one caller re-probes.
+        tokio::time::advance(HOLE_TTL).await;
+        ledger.note("w", &refused("a"), &s);
+        assert_eq!(ledger.len(), 4);
+        assert_eq!(ledger.consult("x", &s), Consult::Reprobe);
+
+        tokio::time::advance(EXPIRED_GRACE).await;
+        ledger.note("v", &refused("a"), &s);
+        // x, y and z went; w is still within its TTL.
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.state("w"), Some(HoleState::Confirmed));
+        assert_eq!(ledger.state("x"), None);
+        assert_eq!(ledger.state("v"), Some(HoleState::Confirmed));
+    }
+
+    /// Past the capacity the least recently used records are evicted; a
+    /// consult counts as a use.
+    #[tokio::test(start_paused = true)]
+    async fn capacity_evicts_least_recently_used() {
+        let ledger = InMemoryHoleLedger::new(Duration::ZERO).with_capacity(10);
+        let s = servers(&["a"]);
+        for i in 0..10 {
+            ledger.note(&format!("id{i}"), &refused("a"), &s);
+        }
+        assert_eq!(ledger.len(), 10);
+        // id0 is the oldest insert but was just used.
+        assert_eq!(ledger.consult("id0", &s), Consult::Skip);
+
+        ledger.note("new", &refused("a"), &s);
+        // Evicted down to 90% of capacity (9), then the new record: 10.
+        assert_eq!(ledger.len(), 10);
+        assert_eq!(ledger.state("id0"), Some(HoleState::Confirmed));
+        assert_eq!(ledger.state("id1"), None, "least recently used went");
+        assert_eq!(ledger.state("id2"), Some(HoleState::Confirmed));
+        assert_eq!(ledger.state("new"), Some(HoleState::Confirmed));
+
+        // Updating a record already held never evicts.
+        ledger.note("id5", &refused("a"), &s);
+        assert_eq!(ledger.len(), 10);
+
+        for i in 0..100 {
+            ledger.note(&format!("more{i}"), &refused("a"), &s);
+            assert!(ledger.len() <= 10);
+        }
     }
 
     #[test]
