@@ -77,9 +77,11 @@ impl UsenetArticleProvider {
     }
 
     /// Shared priority semaphore sized to the current connection capacity.
-    /// Ingest pipelines should `acquire_low` on it so they never starve out
-    /// WebDAV playback, which uses `acquire_high`. Lazily constructed on
-    /// first access.
+    /// Ingest pipelines and read-ahead should `acquire_low` /
+    /// `acquire_readahead` on it so they never starve out WebDAV playback,
+    /// which uses `acquire_high`; repair uses `acquire_repair` and is
+    /// guaranteed a quarter of the pool against read-ahead. Lazily
+    /// constructed on first access.
     pub fn priority_semaphore(&self) -> Arc<PrioritizedSemaphore> {
         Arc::clone(self.priority_semaphore.get_or_init(|| {
             let total = self.total_connections().max(1);
@@ -128,6 +130,20 @@ impl UsenetArticleProvider {
             .await
     }
 
+    /// Read-ahead article fetch: prefetch beyond the segment a client is
+    /// waiting on. Shares the low tier with ingest.
+    pub async fn fetch_decoded_readahead(&self, message_id: &str) -> Result<Vec<u8>> {
+        self.fetch_decoded_with_priority(message_id, FetchPriority::Low)
+            .await
+    }
+
+    /// Repair article fetch: lowest tier, guaranteed the repair floor
+    /// against read-ahead and ingest.
+    pub async fn fetch_decoded_repair(&self, message_id: &str) -> Result<Vec<u8>> {
+        self.fetch_decoded_with_priority(message_id, FetchPriority::Repair)
+            .await
+    }
+
     async fn fetch_decoded_with_priority(
         &self,
         message_id: &str,
@@ -141,6 +157,7 @@ impl UsenetArticleProvider {
         let _permit = match priority {
             FetchPriority::High => sem.acquire_high().await,
             FetchPriority::Low => sem.acquire_low().await,
+            FetchPriority::Repair => sem.acquire_repair().await,
         };
 
         self.fetch_decoded_uncapped(message_id).await
@@ -300,6 +317,7 @@ impl UsenetArticleProvider {
 enum FetchPriority {
     High,
     Low,
+    Repair,
 }
 
 #[cfg(test)]
