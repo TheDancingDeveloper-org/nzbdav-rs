@@ -25,6 +25,7 @@ futures = "0.3"
 
 [dev-dependencies]
 nzb-nntp = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
