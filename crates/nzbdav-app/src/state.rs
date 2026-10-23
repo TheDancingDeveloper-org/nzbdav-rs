@@ -4,7 +4,7 @@ use nzbdav_arr::health_check::HealthCheckService;
 use nzbdav_core::config::ConfigManager;
 use nzbdav_core::database::DavDatabase;
 use nzbdav_stream::provider::UsenetArticleProvider;
-use nzbdav_stream::{CensusConfig, CensusService, DamageCensus};
+use nzbdav_stream::{CensusConfig, CensusService, DamageCensus, RepairConfig, RepairService};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use tokio::sync::watch;
@@ -27,12 +27,45 @@ pub struct AppState {
 
 /// The damage census over `provider`'s pools, recording into the hole
 /// ledger the provider consults, so reads and censuses share one ledger.
+#[cfg(test)]
 pub fn census_service(
     provider: &Arc<UsenetArticleProvider>,
     db: Arc<dyn DavDatabase>,
 ) -> Arc<CensusService> {
+    census_service_with_repair(provider, db, None)
+}
+
+/// The census service, scheduling repairs on `repair` when given.
+pub fn census_service_with_repair(
+    provider: &Arc<UsenetArticleProvider>,
+    db: Arc<dyn DavDatabase>,
+    repair: Option<Arc<RepairService>>,
+) -> Arc<CensusService> {
     let census = DamageCensus::new(provider.clone(), provider.ledger(), CensusConfig::default());
-    Arc::new(CensusService::new(Arc::new(census), db))
+    let service = CensusService::new(Arc::new(census), db);
+    Arc::new(match repair {
+        Some(repair) => service.with_repair(repair),
+        None => service,
+    })
+}
+
+/// The PAR2 repair job over `provider`'s pools, its hole ledger and patch
+/// store, switched by `enable_repair`. `None` without a patch store: repairs
+/// would have nowhere to go.
+pub fn repair_service(
+    provider: &Arc<UsenetArticleProvider>,
+    config: &ConfigManager,
+) -> Option<Arc<RepairService>> {
+    let patches = provider.patches()?;
+    let config = config.clone();
+    let service = RepairService::new(
+        provider.clone(),
+        provider.ledger(),
+        patches,
+        RepairConfig::default(),
+    )
+    .with_switch(move || config.get_enable_repair());
+    Some(Arc::new(service))
 }
 
 /// The background health check, checking items by a damage census so the

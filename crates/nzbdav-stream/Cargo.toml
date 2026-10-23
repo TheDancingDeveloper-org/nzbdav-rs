@@ -26,6 +26,7 @@ futures = "0.3"
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rust-par2 = { workspace = true }
 
 [dev-dependencies]
 nzbdav-core = { workspace = true, features = ["sqlite"] }
@@ -33,6 +34,7 @@ chrono = { workspace = true }
 nzb-nntp = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+md-5 = { workspace = true }
 
 [lints]
 workspace = true

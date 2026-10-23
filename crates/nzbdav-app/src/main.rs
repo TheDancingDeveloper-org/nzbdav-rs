@@ -87,8 +87,15 @@ async fn main() -> anyhow::Result<()> {
     }
     let provider = Arc::new(provider);
 
-    // Damage census over the provider's pools, sharing its hole ledger.
-    let census = state::census_service(&provider, dav_db.clone());
+    // Damage census over the provider's pools, sharing its hole ledger, and
+    // the repair job it schedules (switched by `enable_repair`).
+    let repair = state::repair_service(&provider, &config);
+    tracing::info!(
+        available = repair.is_some(),
+        enabled = config.get_enable_repair(),
+        "PAR2 repair"
+    );
+    let census = state::census_service_with_repair(&provider, dav_db.clone(), repair);
 
     let dav_store = Arc::new(
         DatabaseStore::new(

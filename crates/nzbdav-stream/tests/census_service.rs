@@ -16,7 +16,8 @@ use nzbdav_core::sqlite_db::SqliteDavDatabase;
 use nzbdav_stream::census::{CensusBackend, DamageUnit};
 use nzbdav_stream::{
     CensusConfig, CensusService, CensusTrigger, DamageCensus, HoleLedger, HoleState,
-    InMemoryHoleLedger, PoolStat, PrioritizedPermit, StreamError, Verdict, is_missing_article,
+    InMemoryHoleLedger, PatchStore, PoolStat, PrioritizedPermit, RepairBackend, RepairConfig,
+    RepairOutcome, RepairService, StreamError, Verdict, is_missing_article,
 };
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -213,6 +214,62 @@ async fn operator_survey_records_holes_in_the_ledger() {
     assert_eq!(report.verdict, Some(Verdict::Repairable));
     assert_eq!(ledger.state("m2"), Some(HoleState::Confirmed));
     assert_eq!(ledger.state("m1"), None);
+}
+
+/// Fetches nothing: every article is gone.
+struct NoArticles;
+
+#[async_trait]
+impl RepairBackend for NoArticles {
+    fn servers(&self) -> Vec<String> {
+        vec!["only".into()]
+    }
+    async fn fetch_repair(&self, message_id: &str) -> nzbdav_stream::Result<Vec<u8>> {
+        Err(StreamError::ArticleNotFound(message_id.into()))
+    }
+}
+
+/// A census that finds lost slices the set may cover schedules a repair of
+/// the set; an intact one does not.
+#[tokio::test]
+async fn census_with_damage_schedules_a_repair() {
+    let f = fixture().await;
+    let ledger = Arc::new(InMemoryHoleLedger::new(Duration::ZERO));
+    let repair = Arc::new(RepairService::new(
+        Arc::new(NoArticles),
+        ledger.clone(),
+        Arc::new(PatchStore::in_memory(1 << 20)),
+        RepairConfig::default(),
+    ));
+    let backend = Arc::new(OnePool {
+        missing: ["m2".to_string()].into_iter().collect(),
+        calls: Mutex::new(0),
+    });
+    let census = Arc::new(DamageCensus::new(backend, ledger, CensusConfig::default()));
+    let service = CensusService::new(census, f.db.clone()).with_repair(repair.clone());
+
+    let results = service
+        .survey_item(&f.loose, CensusTrigger::Operator)
+        .await
+        .unwrap();
+    let key = results[0].as_ref().unwrap().key.clone();
+    assert!(
+        repair.signal(&key).is_none(),
+        "an item without a set is not repaired"
+    );
+
+    let results = service
+        .survey_item(&f.protected, CensusTrigger::Operator)
+        .await
+        .unwrap();
+    let key = results[0].as_ref().unwrap().key.clone();
+    // The fixture's set has no index packets, so the attempt fails.
+    let outcome = repair.wait(&key).await.expect("repair scheduled");
+    assert!(
+        matches!(outcome, RepairOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+    assert!(repair.cooldown_remaining(&key).is_some());
 }
 
 #[tokio::test]

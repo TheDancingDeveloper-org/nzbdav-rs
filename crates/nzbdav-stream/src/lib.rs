@@ -16,6 +16,7 @@ pub mod patches;
 pub mod prioritized_semaphore;
 pub mod provider;
 pub mod recovery_set;
+pub mod repair;
 pub mod seekable_segment_stream;
 pub mod testing;
 
@@ -37,6 +38,9 @@ pub use patches::{PatchError, PatchStamp, PatchStore, PatchTotals, ReleaseVerdic
 pub use prioritized_semaphore::{PermitTier, PrioritizedPermit, PrioritizedSemaphore};
 pub use provider::{HoleConfig, PoolStat, UsenetArticleProvider, YencHeaders};
 pub use recovery_set::{census_files, load_recovery_sets};
+pub use repair::{
+    RepairBackend, RepairConfig, RepairOutcome, RepairService, RepairTarget, Scheduled, SkipReason,
+};
 pub use seekable_segment_stream::SeekableSegmentStream;
 
 // Re-export nzb_nntp so consumers can use the same ConnectionPool/ServerConfig types

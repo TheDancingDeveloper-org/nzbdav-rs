@@ -56,7 +56,11 @@ pub fn census_files(record: &Par2SetRecord) -> Vec<CensusFile> {
         .collect()
 }
 
-fn census_file(file: &Par2ProtectedFile, release_part_size: Option<u64>) -> Option<CensusFile> {
+/// One protected file as the release carries it; `None` when it does not.
+pub(crate) fn census_file(
+    file: &Par2ProtectedFile,
+    release_part_size: Option<u64>,
+) -> Option<CensusFile> {
     let carried = file.carried.as_ref()?;
     let n = carried.segment_ids.len() as u64;
     if n == 0 {
