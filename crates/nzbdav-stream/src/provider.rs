@@ -585,6 +585,12 @@ impl UsenetArticleProvider {
             Ok(p) => p,
             Err(e) => return failed(format!("acquire: {e}")),
         };
+        // nzb-nntp answers STAT on a server without it as `ArticleNotFound`,
+        // which would read as a 430. The server cannot tell us anything.
+        if !pooled.conn.capabilities().have_stat {
+            pool_ref.release(pooled);
+            return failed("server does not support STAT".into());
+        }
         match pooled.conn.stat_article(message_id).await {
             Ok(resp) => {
                 pool_ref.release(pooled);

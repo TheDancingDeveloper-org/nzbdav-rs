@@ -1,6 +1,7 @@
 //! nzbdav-rs -- Usenet virtual filesystem with WebDAV serving.
 
 mod auth;
+mod census_api;
 mod cli;
 mod frontend;
 mod log_capture;
@@ -73,11 +74,17 @@ async fn main() -> anyhow::Result<()> {
     // 4. Usenet provider
     let provider = Arc::new(UsenetArticleProvider::new(vec![]));
 
-    let dav_store = Arc::new(DatabaseStore::new(
-        dav_db.clone() as Arc<dyn nzbdav_core::database::DavDatabase>,
-        provider.clone(),
-        config.get_article_buffer_size(),
-    ));
+    // Damage census over the provider's pools, sharing its hole ledger.
+    let census = state::census_service(&provider, dav_db.clone());
+
+    let dav_store = Arc::new(
+        DatabaseStore::new(
+            dav_db.clone() as Arc<dyn nzbdav_core::database::DavDatabase>,
+            provider.clone(),
+            config.get_article_buffer_size(),
+        )
+        .with_census(census.clone()),
+    );
 
     // 5. Background tasks
     let cancel = CancellationToken::new();
@@ -97,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         provider: provider.clone(),
         version: env!("CARGO_PKG_VERSION"),
         queue_status: qm_status_rx.clone(),
+        census,
     };
 
     // 7. Load saved server configs
@@ -228,6 +236,9 @@ fn build_router(
         )
         .route("/api/servers/{id}/test", post(server_api::test_server));
 
+    // Damage census, on operator request
+    let census = Router::new().route("/api/census/{item_id}", post(census_api::run_census));
+
     // Debug endpoint for stream testing
     let debug_routes =
         Router::new().route("/api/debug/stream/{message_id}", get(debug_stream_segment));
@@ -263,6 +274,7 @@ fn build_router(
         .merge(sab.with_state(state.clone()))
         .merge(servers.with_state(state.clone()))
         .merge(settings.with_state(state.clone()))
+        .merge(census.with_state(state.clone()))
         .merge(debug_routes.with_state(state.clone()))
         .merge(logs)
         .merge(ws_route)

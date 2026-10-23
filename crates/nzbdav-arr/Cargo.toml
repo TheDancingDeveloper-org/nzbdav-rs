@@ -20,5 +20,9 @@ chrono = { workspace = true }
 bincode = { workspace = true }
 rusqlite = { workspace = true }
 
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

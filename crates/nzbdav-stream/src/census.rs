@@ -13,8 +13,9 @@
 //! A release is only declared beyond repair when even the best case cannot
 //! be repaired, otherwise the verdict stays open and the next damage retries.
 //!
-//! STATs run on low-priority permits, bounded per pool by the pool's own
-//! connection count, so a census never starves playback.
+//! STATs run on low-priority permits, and every census together holds at
+//! most a share of each pool's connections, so a census never starves
+//! playback, even on a small pool.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::StreamExt;
 use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::holes::{HoleLedger, HoleState, Outcome};
@@ -36,9 +38,12 @@ pub struct CensusConfig {
     /// Deadline for one STAT on one pool. A STAT that misses it is a pool
     /// failure, not a miss.
     pub stat_timeout: Duration,
-    /// Upper bound on concurrent STATs against one pool, further capped by
-    /// the pool's connection count.
+    /// Upper bound on concurrent STATs against one pool, across every
+    /// census running, further capped by `max_pool_share_percent`.
     pub max_in_flight_per_pool: usize,
+    /// Share of a pool's connections all censuses together may hold (at
+    /// least one), so the rest stay free for playback.
+    pub max_pool_share_percent: usize,
     /// After this many consecutive failures with no answer in between, the
     /// rest of the pass skips the pool (each skipped article counts as a
     /// failure on it) instead of waiting out a dead server article by article.
@@ -50,7 +55,8 @@ pub struct CensusConfig {
     /// Pause on a release after a census that reached no clean verdict, or
     /// a failed repair (zurg `repairCooldown`).
     pub cooldown: Duration,
-    /// Article results held in the cache before expired entries are pruned.
+    /// Article results the cache holds. Past it, expired entries are pruned
+    /// first, then the entries closest to expiry.
     pub cache_capacity: usize,
 }
 
@@ -59,6 +65,7 @@ impl Default for CensusConfig {
         Self {
             stat_timeout: Duration::from_secs(20),
             max_in_flight_per_pool: 8,
+            max_pool_share_percent: 25,
             pool_trip_after: 16,
             present_ttl: Duration::from_secs(6 * 3600),
             missing_ttl: Duration::from_secs(30 * 60),
@@ -77,7 +84,8 @@ pub trait CensusBackend: Send + Sync {
     /// Pools in priority order.
     fn pool_count(&self) -> usize;
     fn pool_name(&self, pool: usize) -> String;
-    /// Connection limit of one pool; bounds census concurrency on it.
+    /// Connection limit of one pool; with `max_pool_share_percent` it
+    /// bounds census concurrency on the pool.
     fn pool_connections(&self, pool: usize) -> usize;
     /// STAT one article on one pool, no failover.
     async fn stat_on_pool(&self, pool: usize, message_id: &str) -> PoolStat;
@@ -256,6 +264,9 @@ pub struct DamageCensus {
     cache: Mutex<HashMap<String, (ArticleState, Instant)>>,
     cooldowns: Mutex<HashMap<String, Instant>>,
     running: Mutex<HashSet<String>>,
+    /// STAT slots per pool, by pool name, shared by every census: the slot
+    /// count and the semaphore holding them.
+    pool_slots: Mutex<HashMap<String, (usize, Arc<Semaphore>)>>,
 }
 
 struct RunningGuard<'a> {
@@ -289,7 +300,35 @@ impl DamageCensus {
             cache: Mutex::new(HashMap::new()),
             cooldowns: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
+            pool_slots: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Article results held in the cache.
+    pub fn cached_articles(&self) -> usize {
+        self.cache.lock().len()
+    }
+
+    /// STATs every census together may run against one pool at once.
+    pub fn pool_width(&self, pool: usize) -> usize {
+        let connections = self.backend.pool_connections(pool);
+        let share = connections.saturating_mul(self.config.max_pool_share_percent) / 100;
+        self.config.max_in_flight_per_pool.min(share).max(1)
+    }
+
+    /// The slot semaphore of one pool, resized when the pool's width changed.
+    fn pool_slots(&self, pool: usize) -> (usize, Arc<Semaphore>) {
+        let width = self.pool_width(pool);
+        let name = self.backend.pool_name(pool);
+        let mut slots = self.pool_slots.lock();
+        let entry = slots
+            .entry(name)
+            .or_insert_with(|| (width, Arc::new(Semaphore::new(width))));
+        if entry.0 != width {
+            // STATs still holding the old semaphore's slots finish on it.
+            *entry = (width, Arc::new(Semaphore::new(width)));
+        }
+        (entry.0, Arc::clone(&entry.1))
     }
 
     /// Time left on a release's cooldown, if any.
@@ -480,9 +519,7 @@ impl DamageCensus {
             }
             states.insert(id, state);
         }
-        if cache.len() > self.config.cache_capacity {
-            cache.retain(|_, (_, expires)| *expires > now);
-        }
+        enforce_capacity(&mut cache, self.config.cache_capacity, now);
         drop(cache);
 
         // Misses go to the ledger in `assess`, which needs the state. An
@@ -497,43 +534,84 @@ impl DamageCensus {
 
     /// STAT `ids` on one pool, pipelined; answers come back in `ids` order.
     async fn stat_pass(&self, pool: usize, ids: &[String]) -> Vec<PoolStat> {
-        let width = self
-            .config
-            .max_in_flight_per_pool
-            .min(self.backend.pool_connections(pool))
-            .max(1);
-        let consecutive_failures = AtomicUsize::new(0);
+        let (width, slots) = self.pool_slots(pool);
+        let consecutive = Arc::new(AtomicUsize::new(0));
         let trip = self.config.pool_trip_after.max(1);
         let timeout = self.config.stat_timeout;
-        let backend = &self.backend;
-        let consecutive = &consecutive_failures;
 
-        futures::stream::iter(ids.iter())
-            .map(|id| async move {
-                if consecutive.load(Ordering::Relaxed) >= trip {
-                    return PoolStat::Failed("pool skipped after repeated failures".into());
-                }
-                let _permit = backend.acquire_low().await;
-                if consecutive.load(Ordering::Relaxed) >= trip {
-                    return PoolStat::Failed("pool skipped after repeated failures".into());
-                }
-                let answer =
-                    match tokio::time::timeout(timeout, backend.stat_on_pool(pool, id)).await {
+        // Each STAT owns what it uses, so the census future stays `Send`
+        // for any caller that spawns it.
+        futures::stream::iter(ids.to_vec())
+            .map(|id| {
+                let backend = Arc::clone(&self.backend);
+                let consecutive = Arc::clone(&consecutive);
+                let slots = Arc::clone(&slots);
+                async move {
+                    if consecutive.load(Ordering::Relaxed) >= trip {
+                        return PoolStat::Failed("pool skipped after repeated failures".into());
+                    }
+                    let Ok(_slot) = slots.acquire().await else {
+                        return PoolStat::Failed("census pool slots closed".into());
+                    };
+                    let _permit = backend.acquire_low().await;
+                    if consecutive.load(Ordering::Relaxed) >= trip {
+                        return PoolStat::Failed("pool skipped after repeated failures".into());
+                    }
+                    let answer = match tokio::time::timeout(
+                        timeout,
+                        backend.stat_on_pool(pool, &id),
+                    )
+                    .await
+                    {
                         Ok(answer) => answer,
                         Err(_) => PoolStat::Failed(format!("STAT timed out after {timeout:?}")),
                     };
-                match answer {
-                    PoolStat::Failed(_) => {
-                        consecutive.fetch_add(1, Ordering::Relaxed);
+                    match answer {
+                        PoolStat::Failed(_) => {
+                            consecutive.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => consecutive.store(0, Ordering::Relaxed),
                     }
-                    _ => consecutive.store(0, Ordering::Relaxed),
+                    answer
                 }
-                answer
             })
             .buffered(width)
             .collect()
             .await
     }
+}
+
+/// Hold the cache to `capacity`: drop expired entries, then, if every entry
+/// is still fresh, the ones closest to expiry, down to 90% so the next pass
+/// does not have to evict again at once.
+fn enforce_capacity(
+    cache: &mut HashMap<String, (ArticleState, Instant)>,
+    capacity: usize,
+    now: Instant,
+) {
+    if cache.len() <= capacity {
+        return;
+    }
+    cache.retain(|_, (_, expires)| *expires > now);
+    if cache.len() <= capacity {
+        return;
+    }
+    let keep = capacity - capacity / 10;
+    let mut by_expiry: Vec<(Instant, String)> = cache
+        .iter()
+        .map(|(id, (_, expires))| (*expires, id.clone()))
+        .collect();
+    let evict = by_expiry.len() - keep;
+    if evict < by_expiry.len() {
+        by_expiry.select_nth_unstable(evict);
+    }
+    for (_, id) in by_expiry.into_iter().take(evict) {
+        cache.remove(&id);
+    }
+    debug!(
+        evicted = evict,
+        capacity, "census cache full, evicted soonest to expire"
+    );
 }
 
 /// Every distinct message id the census must settle: data articles, then
@@ -754,6 +832,10 @@ mod tests {
         pools: Vec<HashMap<String, PoolStat>>,
         hang: Vec<HashSet<String>>,
         calls: Mutex<Vec<(usize, String)>>,
+        connections: usize,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
     }
 
     impl FakePools {
@@ -762,6 +844,10 @@ mod tests {
                 pools: vec![HashMap::new(); n],
                 hang: vec![HashSet::new(); n],
                 calls: Mutex::new(Vec::new()),
+                connections: 4,
+                delay: Duration::ZERO,
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
             }
         }
 
@@ -791,10 +877,14 @@ mod tests {
             format!("pool-{pool}")
         }
         fn pool_connections(&self, _pool: usize) -> usize {
-            4
+            self.connections
         }
         async fn stat_on_pool(&self, pool: usize, message_id: &str) -> PoolStat {
             self.calls.lock().push((pool, message_id.to_string()));
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             if self.hang[pool].contains(message_id) {
                 std::future::pending::<()>().await;
             }
@@ -1110,6 +1200,115 @@ mod tests {
         assert_eq!(report.present, 50);
         assert_eq!(backend.calls_on(0).len(), 4);
         assert_eq!(report.pool_failures[0].failed, 50);
+    }
+
+    /// Cached results are reused within their TTL and asked again after it.
+    #[tokio::test]
+    async fn cache_entries_expire() {
+        let mut pools = FakePools::new(1);
+        pools.set(0, "here", PoolStat::Present);
+        let backend = Arc::new(pools);
+        let census = DamageCensus::new(
+            backend.clone(),
+            confirm_now(),
+            CensusConfig {
+                present_ttl: Duration::from_millis(40),
+                missing_ttl: Duration::from_millis(40),
+                ..CensusConfig::default()
+            },
+        );
+        let target = CensusTarget {
+            key: "k".into(),
+            files: vec![file("f", &["here", "gone"], 10)],
+            recovery: None,
+        };
+        census.run(&target, CensusTrigger::Operator).await.unwrap();
+        census.run(&target, CensusTrigger::Operator).await.unwrap();
+        assert_eq!(backend.calls_on(0).len(), 2, "second run served from cache");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        census.run(&target, CensusTrigger::Operator).await.unwrap();
+        assert_eq!(backend.calls_on(0).len(), 4, "expired entries asked again");
+    }
+
+    /// The cache stays within its capacity even when every entry is fresh.
+    #[tokio::test]
+    async fn cache_capacity_holds_when_every_entry_is_fresh() {
+        let mut pools = FakePools::new(1);
+        let ids: Vec<String> = (0..20).map(|i| format!("a{i}")).collect();
+        for id in &ids {
+            pools.set(0, id, PoolStat::Present);
+        }
+        let census = DamageCensus::new(
+            Arc::new(pools),
+            confirm_now(),
+            CensusConfig {
+                cache_capacity: 10,
+                ..CensusConfig::default()
+            },
+        );
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let target = CensusTarget {
+            key: "k".into(),
+            files: vec![file("f", &refs, 10)],
+            recovery: None,
+        };
+        let report = census.run(&target, CensusTrigger::Operator).await.unwrap();
+        assert_eq!(report.present, 20);
+        assert!(
+            census.cached_articles() <= 10,
+            "{}",
+            census.cached_articles()
+        );
+        assert!(census.cached_articles() > 0);
+    }
+
+    /// Censuses of different releases share one pool's slots: with 8
+    /// connections and a 25% share, no more than 2 STATs run on the pool at
+    /// once, however many censuses are running.
+    #[tokio::test]
+    async fn concurrent_censuses_share_a_capped_pool() {
+        let mut pools = FakePools::new(1);
+        pools.connections = 8;
+        pools.delay = Duration::from_millis(5);
+        let backend = Arc::new(pools);
+        let census = Arc::new(DamageCensus::new(
+            backend.clone(),
+            confirm_now(),
+            CensusConfig::default(),
+        ));
+        assert_eq!(census.pool_width(0), 2);
+
+        let runs = (0..4).map(|r| {
+            let census = Arc::clone(&census);
+            async move {
+                let ids: Vec<String> = (0..10).map(|i| format!("r{r}-{i}")).collect();
+                let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                let target = CensusTarget {
+                    key: format!("k{r}"),
+                    files: vec![file("f", &refs, 10)],
+                    recovery: None,
+                };
+                census.run(&target, CensusTrigger::Operator).await.unwrap()
+            }
+        });
+        futures::future::join_all(runs).await;
+        assert_eq!(backend.calls_on(0).len(), 40);
+        assert!(backend.peak.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn pool_width_leaves_most_connections_to_playback() {
+        let census = |connections: usize| {
+            let mut pools = FakePools::new(1);
+            pools.connections = connections;
+            DamageCensus::new(Arc::new(pools), confirm_now(), CensusConfig::default())
+        };
+        assert_eq!(census(1).pool_width(0), 1);
+        assert_eq!(census(4).pool_width(0), 1);
+        assert_eq!(census(8).pool_width(0), 2);
+        assert_eq!(census(20).pool_width(0), 5);
+        assert_eq!(census(100).pool_width(0), 8, "capped by max_in_flight");
     }
 
     #[test]

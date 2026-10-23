@@ -1509,6 +1509,7 @@ dependencies = [
 name = "nzbdav-arr"
 version = "0.5.7"
 dependencies = [
+ "async-trait",
  "bincode",
  "chrono",
  "nzbdav-core",
@@ -1555,6 +1556,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "futures",
  "http",
  "http-body-util",
  "mime_guess",
@@ -1616,8 +1618,10 @@ dependencies = [
  "aes",
  "arc-swap",
  "async-trait",
+ "bincode",
  "bytes",
  "cbc",
+ "chrono",
  "crc32fast",
  "futures",
  "nzb-decode",

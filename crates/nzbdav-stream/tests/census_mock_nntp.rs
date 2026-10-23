@@ -154,3 +154,54 @@ async fn every_pool_saying_430_is_a_miss() {
     assert!(report.pool_failures.is_empty());
     assert_eq!(report.verdict, Some(Verdict::BeyondRepair));
 }
+
+/// A server that does not know STAT answers `500`: that is the server
+/// failing to answer, never a 430, so the article stays unestablished.
+#[tokio::test]
+async fn server_without_stat_is_a_failure_not_a_miss() {
+    let a = MockNntpServer::start(mock(&[])).await;
+    let mut b_config = mock(&[]);
+    b_config.article_response_overrides =
+        HashMap::from([("x".to_string(), 500), ("y".to_string(), 500)]);
+    let b = MockNntpServer::start(b_config).await;
+    let census = census(
+        vec![pool("A", a.port()), pool("B", b.port())],
+        Duration::from_secs(5),
+    );
+    let report = census
+        .run(&target(&["x", "y"]), CensusTrigger::Operator)
+        .await
+        .unwrap();
+    assert!(report.missing_ids.is_empty());
+    assert_eq!(report.unestablished_ids, vec!["x", "y"]);
+    assert_eq!(report.pool_failures.len(), 1);
+    assert_eq!(report.pool_failures[0].name, "B");
+    assert_eq!(report.verdict, None);
+}
+
+/// A STAT that times out gives its connection back: on a one-connection
+/// pool, the next acquire succeeds rather than waiting forever.
+#[tokio::test]
+async fn timed_out_stat_returns_its_connection() {
+    let mut config = mock(&[]);
+    config.hang_after_command = Some("STAT".into());
+    let server = MockNntpServer::start(config).await;
+    let mut server_config = test_config(server.port());
+    server_config.name = "slow".into();
+    server_config.connections = 1;
+    let slow = Arc::new(ConnectionPool::new(Arc::new(server_config)));
+
+    let census = census(vec![slow.clone()], Duration::from_millis(200));
+    let report = census
+        .run(&target(&["x", "y"]), CensusTrigger::Operator)
+        .await
+        .unwrap();
+    assert_eq!(report.unestablished_ids, vec!["x", "y"]);
+    assert!(report.pool_failures[0].last_error.contains("timed out"));
+
+    let conn = tokio::time::timeout(Duration::from_secs(5), slow.acquire())
+        .await
+        .expect("the timed-out STAT's connection came back")
+        .expect("a fresh connection opens");
+    slow.discard(conn);
+}
