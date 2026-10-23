@@ -11,6 +11,7 @@ description = "On-demand segment streaming from Usenet for nzbdav"
 nzbdav-core = { workspace = true }
 nzb-nntp = { workspace = true }
 nzb-decode = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }

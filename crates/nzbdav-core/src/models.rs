@@ -146,6 +146,109 @@ impl LongRange {
 }
 
 // ---------------------------------------------------------------------------
+// PAR2 recovery sets (persisted at import)
+// ---------------------------------------------------------------------------
+
+/// One PAR2 recovery set of a release, recorded at import so the damage
+/// census and the repair job can work without fetching the PAR2 files again.
+///
+/// The set's critical packets (main, file description, IFSC, creator) are
+/// kept raw in `index_packets`, deduplicated and stripped of recovery slices.
+/// They are not compressed: the bulk is per-slice MD5 and CRC32 checksums,
+/// which do not compress. Their size is bounded by the index file size the
+/// import accepts (5 MiB), and `index_segment_ids` are kept so the index can
+/// be fetched again if a row is ever dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Par2SetRecord {
+    pub recovery_set_id: [u8; 16],
+    /// Slice (block) size in bytes.
+    pub slice_size: u64,
+    /// Raw critical packets of the set, parseable by any PAR2 reader.
+    pub index_packets: Vec<u8>,
+    /// Articles of the index file the packets were read from.
+    pub index_segment_ids: Vec<String>,
+    /// Protected files in main-packet order (ascending file id).
+    pub files: Vec<Par2ProtectedFile>,
+    /// Recovery volumes of the set. Not downloaded and not visible in DAV.
+    pub volumes: Vec<Par2VolumeRecord>,
+    /// Decoded size of a full yEnc part, learned from first segments, so
+    /// article spans can be sized without probing.
+    pub part_size: Option<u64>,
+}
+
+impl Par2SetRecord {
+    /// Recovery blocks the release carries for this set.
+    pub fn recovery_blocks(&self) -> u64 {
+        self.volumes.iter().map(|v| u64::from(v.blocks)).sum()
+    }
+
+    /// Slices the set protects.
+    pub fn source_slices(&self) -> u64 {
+        let slice = self.slice_size.max(1);
+        self.files.iter().map(|f| f.size.div_ceil(slice)).sum()
+    }
+}
+
+/// A file the set protects, and where the release carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Par2ProtectedFile {
+    pub file_id: [u8; 16],
+    /// Name in the PAR2 file description packet.
+    pub name: String,
+    pub size: u64,
+    /// The NZB file matched by the first-16 KiB MD5; `None` when the release
+    /// does not carry it.
+    pub carried: Option<Par2CarriedFile>,
+    /// DAV items that read from this file: the file itself for plain files,
+    /// the extracted files for RAR volumes.
+    pub dav_item_ids: Vec<Uuid>,
+}
+
+/// The NZB file carrying a protected file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Par2CarriedFile {
+    /// Name in the NZB subject.
+    pub subject_name: String,
+    /// Article message ids in segment order.
+    pub segment_ids: Vec<String>,
+    /// Decoded size of the first article.
+    pub part_size: Option<u64>,
+}
+
+/// A PAR2 recovery volume and the articles that carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Par2VolumeRecord {
+    pub name: String,
+    /// First recovery exponent, from a `.volNN+MM` name.
+    pub first_exponent: Option<u32>,
+    /// Recovery blocks the volume holds.
+    pub blocks: u32,
+    pub blocks_source: Par2BlockSource,
+    /// Size in the NZB (encoded article bytes).
+    pub size: u64,
+    pub segment_ids: Vec<String>,
+}
+
+/// Where a volume's block count came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Par2BlockSource {
+    /// Counted from the recovery packets the import parsed.
+    Parsed,
+    /// From the `.volNN+MM` file name.
+    FileName,
+    /// Estimated from the NZB size and the slice size (obfuscated names).
+    Estimated,
+}
+
+/// Reverse mapping entry: a protected file a DAV item reads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Par2FileRef {
+    pub history_item_id: Uuid,
+    pub recovery_set_id: [u8; 16],
+    pub file_id: [u8; 16],
+}
+
+// ---------------------------------------------------------------------------
 // Queue and history
 // ---------------------------------------------------------------------------
 

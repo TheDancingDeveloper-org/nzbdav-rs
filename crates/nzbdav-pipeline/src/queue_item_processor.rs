@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,10 +16,13 @@ use nzbdav_stream::provider::UsenetArticleProvider;
 
 use crate::aggregators::{aggregate_plain_files, aggregate_rar_files};
 use crate::deobfuscation::{
-    NzbFileInfo, fetch_first_segments::fetch_first_segments, get_file_infos::get_file_infos,
-    get_par2_file_descriptors::get_par2_file_descriptors,
+    NzbFileInfo,
+    fetch_first_segments::fetch_first_segments,
+    get_file_infos::get_file_infos,
+    get_par2_file_descriptors::{Par2IndexSet, get_par2_file_descriptors},
 };
 use crate::error::{PipelineError, Result};
+use crate::par2_sets::build_set_records;
 use crate::post_processors::{
     create_strm_items, ensure_importable_video, filter_blocklisted, rename_duplicates,
 };
@@ -223,6 +227,7 @@ impl QueueItemProcessor {
                         is_par2: false,
                         first_16k: None,
                         hash_16k: None,
+                        first_segment_size: None,
                         first_segment_error: None,
                         first_segment_missing_article: None,
                     }
@@ -243,10 +248,12 @@ impl QueueItemProcessor {
         };
 
         let stage_start = Instant::now();
-        let par2_files = get_par2_file_descriptors(&self.provider, &file_infos).await?;
+        let par2_sets = get_par2_file_descriptors(&self.provider, &file_infos).await?;
+        let par2_files = Par2IndexSet::descriptors(&par2_sets);
         info!(
             job_name = %queue_item.job_name,
             elapsed_ms = stage_start.elapsed().as_millis() as u64,
+            sets = par2_sets.len(),
             descriptors = par2_files.len(),
             "PAR2 descriptor fetch complete"
         );
@@ -377,6 +384,23 @@ impl QueueItemProcessor {
 
         let surviving_ids: std::collections::HashSet<Uuid> = items.iter().map(|i| i.id).collect();
 
+        // Articles each inserted DAV item reads, for the PAR2 file mapping.
+        let mut dav_items_by_segment: HashMap<&str, Vec<Uuid>> = HashMap::new();
+        for (id, multipart) in &multipart_blobs {
+            if surviving_ids.contains(id) {
+                for segment in multipart.file_parts.iter().flat_map(|p| &p.segment_ids) {
+                    dav_items_by_segment.entry(segment).or_default().push(*id);
+                }
+            }
+        }
+        for (id, nzb_file) in &nzb_file_blobs {
+            if surviving_ids.contains(id) {
+                for segment in &nzb_file.segment_ids {
+                    dav_items_by_segment.entry(segment).or_default().push(*id);
+                }
+            }
+        }
+
         let mut total_created: usize = 0;
         if job_dir.id != planned_job_dir_id {
             for item in &mut items {
@@ -414,6 +438,34 @@ impl QueueItemProcessor {
         for item in &strm_items {
             db.insert_dav_item(item).await?;
             total_created += 1;
+        }
+
+        // Record the PAR2 sets. Replaces anything an earlier import of this
+        // item left; a failure here never fails the import.
+        let par2_records = build_set_records(&par2_sets, &file_infos, &dav_items_by_segment);
+        match db
+            .put_par2_sets(queue_item.id, job_dir.id, &par2_records)
+            .await
+        {
+            Ok(()) => {
+                for record in &par2_records {
+                    info!(
+                        job_name = %queue_item.job_name,
+                        recovery_set_id = %hex::encode(record.recovery_set_id),
+                        files = record.files.len(),
+                        carried = record.files.iter().filter(|f| f.carried.is_some()).count(),
+                        volumes = record.volumes.len(),
+                        source_slices = record.source_slices(),
+                        recovery_blocks = record.recovery_blocks(),
+                        "recorded PAR2 recovery set"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                job_name = %queue_item.job_name,
+                error = %e,
+                "failed to record PAR2 recovery sets"
+            ),
         }
 
         info!(
@@ -577,6 +629,7 @@ mod tests {
             is_par2: false,
             first_16k: None,
             hash_16k: None,
+            first_segment_size: None,
             first_segment_error: first_segment_missing_article
                 .map(|id| format!("article not found: {id}")),
             first_segment_missing_article: first_segment_missing_article.map(str::to_owned),

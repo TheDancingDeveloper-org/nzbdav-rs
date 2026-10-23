@@ -91,6 +91,30 @@ CREATE TABLE IF NOT EXISTS nzb_blobs (
     id TEXT PRIMARY KEY,
     data BLOB NOT NULL
 );
+
+-- PAR2 recovery sets recorded at import, one row per set. `data` holds the
+-- bincode Par2SetRecord (critical packets, file mapping, volume articles).
+-- Rows go with the job directory, and are deleted with the history item.
+CREATE TABLE IF NOT EXISTS par2_sets (
+    id TEXT PRIMARY KEY,
+    history_item_id TEXT NOT NULL,
+    job_dir_id TEXT NOT NULL REFERENCES dav_items(id) ON DELETE CASCADE,
+    recovery_set_id BLOB NOT NULL,
+    slice_size INTEGER NOT NULL,
+    recovery_blocks INTEGER NOT NULL,
+    data BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_par2_sets_history ON par2_sets(history_item_id);
+CREATE INDEX IF NOT EXISTS idx_par2_sets_job_dir ON par2_sets(job_dir_id);
+
+-- Reverse of the PAR2 file mapping: which protected files a DAV item reads.
+CREATE TABLE IF NOT EXISTS par2_file_map (
+    set_id TEXT NOT NULL REFERENCES par2_sets(id) ON DELETE CASCADE,
+    file_id BLOB NOT NULL,
+    dav_item_id TEXT NOT NULL REFERENCES dav_items(id) ON DELETE CASCADE,
+    PRIMARY KEY (set_id, file_id, dav_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_par2_file_map_dav_item ON par2_file_map(dav_item_id);
 "#;
 
 pub fn open(path: &str) -> Result<Connection> {

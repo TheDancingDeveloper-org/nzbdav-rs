@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::database::DavDatabase;
 use crate::error::{DavError, Result};
-use crate::models::{DavItem, HistoryItem, QueueItem};
-use crate::{blob_store, dav_items, history_items, queue_items};
+use crate::models::{DavItem, HistoryItem, Par2FileRef, Par2SetRecord, QueueItem};
+use crate::{blob_store, dav_items, history_items, par2_sets, queue_items};
 
 /// SQLite-backed implementation of `DavDatabase`.
 ///
@@ -152,6 +152,44 @@ impl DavDatabase for SqliteDavDatabase {
             &conn,
             "nzb_blobs",
             id
+        ))
+    }
+
+    // ── PAR2 recovery sets ─────────────────────────────────────────────
+
+    async fn put_par2_sets(
+        &self,
+        history_item_id: Uuid,
+        job_dir_id: Uuid,
+        sets: &[Par2SetRecord],
+    ) -> Result<()> {
+        let sets = sets.to_vec();
+        blocking!(self, |conn| par2_sets::replace(
+            &conn,
+            history_item_id,
+            job_dir_id,
+            &sets
+        ))
+    }
+
+    async fn get_par2_sets(&self, history_item_id: Uuid) -> Result<Vec<Par2SetRecord>> {
+        blocking!(self, |conn| par2_sets::get_by_history_item_id(
+            &conn,
+            history_item_id
+        ))
+    }
+
+    async fn get_par2_files_for_dav_item(&self, dav_item_id: Uuid) -> Result<Vec<Par2FileRef>> {
+        blocking!(self, |conn| par2_sets::get_files_for_dav_item(
+            &conn,
+            dav_item_id
+        ))
+    }
+
+    async fn delete_par2_sets(&self, history_item_id: Uuid) -> Result<()> {
+        blocking!(self, |conn| par2_sets::delete_by_history_item_id(
+            &conn,
+            history_item_id
         ))
     }
 

@@ -1583,6 +1583,7 @@ dependencies = [
  "nzbdav-core",
  "nzbdav-rar",
  "nzbdav-stream",
+ "parking_lot",
  "regex",
  "rust-par2",
  "serde",
@@ -1626,6 +1627,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

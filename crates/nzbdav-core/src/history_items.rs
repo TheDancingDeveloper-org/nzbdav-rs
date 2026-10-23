@@ -90,7 +90,9 @@ pub fn list(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<HistoryIte
     Ok(items)
 }
 
+/// Delete a history item and the PAR2 sets recorded for it.
 pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
+    crate::par2_sets::delete_by_history_item_id(conn, id)?;
     conn.execute(
         "DELETE FROM history_items WHERE id = ?1",
         params![id.to_string()],
@@ -98,7 +100,9 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// Delete every history item and every recorded PAR2 set.
 pub fn delete_all(conn: &Connection) -> Result<()> {
+    crate::par2_sets::delete_all(conn)?;
     conn.execute("DELETE FROM history_items", [])?;
     Ok(())
 }

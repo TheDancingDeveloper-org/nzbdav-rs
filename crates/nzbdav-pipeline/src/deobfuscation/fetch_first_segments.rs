@@ -227,6 +227,7 @@ fn fallback_file_info(
         is_par2,
         first_16k: None,
         hash_16k: None,
+        first_segment_size: None,
         first_segment_error: error.map(ToString::to_string),
         first_segment_missing_article: error
             .and_then(PipelineError::missing_article_id)
@@ -270,6 +271,7 @@ async fn fetch_single_first_segment(
         is_par2,
         first_16k: Some(first_16k_data),
         hash_16k: Some(hash_16k),
+        first_segment_size: Some(decoded.len() as u64),
         first_segment_error: None,
         first_segment_missing_article: None,
     })

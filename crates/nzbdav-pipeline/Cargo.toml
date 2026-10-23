@@ -24,5 +24,9 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 bincode = { workspace = true }
 
+[dev-dependencies]
+nzbdav-core = { workspace = true, features = ["sqlite"] }
+parking_lot = { workspace = true }
+
 [lints]
 workspace = true
